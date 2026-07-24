@@ -8,13 +8,26 @@ Transactions are executed through a **Safe 1/3 multisig**. The bot is one of the
 
 The bot allocates vault funds according to this strategy:
 - **80% idle** - Kept in the vault for immediate withdrawal liquidity
-- **20% allocated** - Distributed across 4 Morpho Blue markets. Each market has its
-  own target, configurable via `TARGET_<MARKET>_BPS` env vars (basis points), and
-  defaulting to 500 (5%) each:
-  - stUSDS/USDS (`TARGET_STUSDS_BPS`, default 5%)
-  - cbBTC/USDS (`TARGET_CBBTC_BPS`, default 5%)
-  - wstETH/USDS (`TARGET_WSTETH_BPS`, default 5%)
-  - WETH/USDS (`TARGET_WETH_BPS`, default 5%)
+- **20% allocated** - Distributed across 5 Morpho Blue markets. Each market has its
+  own target, configurable via `TARGET_<MARKET>_BPS` env vars (basis points). The current
+  scheme retires stUSDS and WETH to 0% and targets ~6.66% each on the other three
+  (667 / 667 / 666 = 2000):
+  - stUSDS/USDS (`TARGET_STUSDS_BPS`, currently 0% — retired)
+  - cbBTC/USDS (`TARGET_CBBTC_BPS`, currently 6.67%)
+  - wstETH/USDS (`TARGET_WSTETH_BPS`, currently 6.67%)
+  - PT-sUSDS/USDS (`TARGET_PTSUSDS_BPS`, currently 6.66%, **91.5% LLTV**)
+  - WETH/USDS (`TARGET_WETH_BPS`, currently 0% — retired)
+
+  **PT-sUSDS/USDS absolute cap.** PT-sUSDS has a 5M USDS absolute cap
+  (`PT_SUSDS_ABSOLUTE_CAP_USDS`, default 5,000,000) enforced off-chain by the bot — *not* a
+  market/vault param. When 6.66% of totalAssets exceeds 5M (i.e. TVL above ~75M), PT-sUSDS is
+  held at 5M and the overflow is split **equally between cbBTC/USDS and wstETH/USDS** so the
+  vault still reaches its 20% allocated target. (At current TVL ~38M the cap doesn't bind.)
+
+  **WETH/USDS drain via utilization cap.** WETH is retired to 0%, but withdrawals are capped
+  so post-withdraw market utilization stays ≤ `WETH_MAX_UTILIZATION_BPS` (default 9300 = 93%);
+  when the market is already at/above 93% the bot withdraws nothing and waits for borrowers to
+  repay. Other markets keep the flat `LIQUIDITY_RESERVE_PERCENT` (5%-of-supply) cushion.
 
   The sum of per-market targets must equal the 20% allocated target; the bot throws on
   startup if they don't. Asymmetric targets let the bot drive migrations — e.g.
