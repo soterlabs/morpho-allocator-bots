@@ -12,7 +12,7 @@ Node/TypeScript bot (its own `package.json`, `src/`, tests, and Railway config):
 
 ```
 morpho-allocator-bots/
-├── flagship-usds/          # bot for the Flagship USDS Vault V2
+├── usds-flagship/          # bot for the Flagship USDS Vault V2
 │   ├── src/
 │   ├── package.json
 │   ├── railway.toml        # Railway build/start/cron for this bot
@@ -28,7 +28,7 @@ To add a bot for another vault, create a new sibling folder with the same layout
 
 Each bot is deployed as its **own Railway service** from this single repository:
 
-- The service's **Root Directory** is set to the bot's folder (e.g. `flagship-usds`), so
+- The service's **Root Directory** is set to the bot's folder (e.g. `usds-flagship`), so
   Railway builds from that folder and reads its `railway.toml` / `nixpacks.toml`.
 - Build/start/cron come from that folder's `railway.toml` (`npm install && npm run build`
   → `npm start`, on a cron schedule).
@@ -38,11 +38,11 @@ Each bot is deployed as its **own Railway service** from this single repository:
 
 ## Targeted vaults
 
-### 1. Flagship USDS Vault V2 — `flagship-usds/`
+### 1. Flagship USDS Vault V2 — `usds-flagship/`
 
 Maintains an **80% idle / 20% allocated** strategy across four USDS-denominated Morpho
 Blue markets. Per-market targets are configurable (basis points) and their sum must equal
-the 20% allocated target. See [`flagship-usds/README.md`](flagship-usds/README.md) for the
+the 20% allocated target. See [`usds-flagship/README.md`](usds-flagship/README.md) for the
 full strategy and setup.
 
 | Role | Address |
@@ -72,4 +72,4 @@ full strategy and setup.
 ### 2. _(next vault — TBD)_
 
 A second allocator bot targeting another Morpho vault will be added as a sibling folder
-(e.g. `flagship-<asset>/`) with its own Railway service, following the structure above.
+(e.g. `<asset>-flagship/`) with its own Railway service, following the structure above.

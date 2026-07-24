@@ -42,7 +42,7 @@ The bot allocates vault funds according to this strategy:
 
 1. Install dependencies:
    ```bash
-   cd flagship-usds
+   cd usds-flagship
    npm install
    ```
 
@@ -101,7 +101,7 @@ Run every 6 hours to maintain allocation:
 crontab -e
 
 # Add this line (adjust paths as needed)
-0 */6 * * * cd /path/to/morpho-allocator-bots/flagship-usds && /usr/bin/npm run allocate >> /var/log/vault-allocator.log 2>&1
+0 */6 * * * cd /path/to/morpho-allocator-bots/usds-flagship && /usr/bin/npm run allocate >> /var/log/vault-allocator.log 2>&1
 ```
 
 ## How It Works
