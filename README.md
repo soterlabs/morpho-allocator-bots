@@ -69,7 +69,11 @@ full strategy and setup.
 > `TARGET_<MARKET>_BPS` env vars; every market that is grown or drained must also have its
 > `ORACLE_*` set.
 
-### 2. _(next vault — TBD)_
+### 2. USDT Savings Vault — `usdt-savings/` _(planned)_
 
-A second allocator bot targeting another Morpho vault will be added as a sibling folder
-(e.g. `<asset>-flagship/`) with its own Railway service, following the structure above.
+A second allocator bot targeting the USDT Savings Morpho vault will be added as a sibling
+folder with its own Railway service (`usdt-savings-bot`), following the structure above.
+
+> **Naming convention:** each folder is named after its vault (not necessarily a
+> `-flagship` suffix) — e.g. `usds-flagship/`, `usdt-savings/` — and its Railway service
+> is `<folder>-bot` (`usds-flagship-bot`, `usdt-savings-bot`).
