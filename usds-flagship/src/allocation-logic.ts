@@ -35,6 +35,13 @@ export interface AllocationInput {
   // or [0, 1000, 1000, 0] for the deallocation migration scheme.
   // Sum should match the overall allocated target (config.targetAllocatedPercent).
   targetPerMarketBpsByIndex: number[];
+  // Optional per-market target AMOUNTS (asset units), one entry per perMarketAssets[] entry.
+  // When provided, these override the bps-derived targets — used when a market's effective
+  // target isn't a static % of totalAssets (e.g. an absolute-capped market whose overflow is
+  // redistributed to sibling markets; see computeEffectiveTargetAmounts). targetPerMarketBpsByIndex
+  // is still supplied and is used ONLY for the target-0 "retired market" sweep semantics
+  // (a redistributed market keeps a positive base bps, so it's never mistaken for retired).
+  targetPerMarketAmountsByIndex?: bigint[];
   rebalanceThresholdBps: number; // basis points, e.g. 100 = 1%
   // Absolute floor (in asset units) for sweeping retired markets. A market whose target
   // is 0 but which still holds at least this much forces a rebalance even when its bps
@@ -110,6 +117,88 @@ export function validateTargetBpsSum(targets: { label: string; bps: number }[], 
 }
 
 /**
+ * Per-market target spec for computeEffectiveTargetAmounts.
+ *   baseBps          — the market's base target as basis points of totalAssets.
+ *   absoluteCap      — optional hard ceiling (asset units) on this market's target. Any base
+ *                      target above it is clamped, and the clipped amount ("overflow") is
+ *                      redistributed to the overflowReceiver markets.
+ *   overflowReceiver — when true, this market absorbs an equal share of the pooled overflow
+ *                      from absolute-capped markets, on top of its own base target.
+ */
+export interface MarketTargetSpec {
+  baseBps: number;
+  absoluteCap?: bigint;
+  overflowReceiver?: boolean;
+}
+
+/**
+ * Compute effective per-market target AMOUNTS from base bps + absolute caps, redistributing
+ * any capped overflow equally across the overflowReceiver markets.
+ *
+ * Used by the Flagship bot for PT-sUSDS/USDS, which has a 5M USDS absolute cap (enforced
+ * off-chain by the bot, not a market param): when 6.66% of totalAssets exceeds 5M, PT-sUSDS
+ * is held at 5M and the excess target is split equally between cbBTC/USDS and wstETH/USDS so
+ * the vault still hits its overall 20% allocated target.
+ *
+ * The redistribution is a pure function of (totalAssets, specs) so it's unit-testable and the
+ * on-chain executor just consumes the resulting amounts. Overflow that can't be placed (no
+ * receivers) is simply left unallocated. Integer remainder from the equal split is handed to
+ * the earliest receivers (deterministic), so the returned amounts sum to the intended total.
+ */
+export function computeEffectiveTargetAmounts(totalAssets: bigint, specs: MarketTargetSpec[]): bigint[] {
+  const eff = specs.map(s => (totalAssets * BigInt(s.baseBps)) / 10000n);
+
+  let overflow = 0n;
+  specs.forEach((s, i) => {
+    if (s.absoluteCap !== undefined && eff[i] > s.absoluteCap) {
+      overflow += eff[i] - s.absoluteCap;
+      eff[i] = s.absoluteCap;
+    }
+  });
+
+  if (overflow > 0n) {
+    // NOTE: overflow is added to receivers without re-checking a receiver's own absoluteCap.
+    // Safe for the current config (only PT-sUSDS is capped; cbBTC/wstETH have no absolute cap).
+    // If a receiver ever gets an absoluteCap, this would need a second capping pass.
+    const receivers = specs.map((_, i) => i).filter(i => specs[i].overflowReceiver);
+    if (receivers.length > 0) {
+      const share = overflow / BigInt(receivers.length);
+      let remainder = overflow - share * BigInt(receivers.length);
+      for (const i of receivers) {
+        eff[i] += share;
+        if (remainder > 0n) { eff[i] += 1n; remainder -= 1n; }
+      }
+    }
+  }
+
+  return eff;
+}
+
+/**
+ * Maximum amount withdrawable from a Morpho Blue market without pushing utilization above
+ * maxUtilizationBps. Deallocating removes supply while borrows stay put, so withdrawing W
+ * leaves utilization = borrow / (supply - W). We keep that <= maxUtil, i.e.
+ *   supply - W >= borrow / maxUtil  =>  W <= supply - ceil(borrow / maxUtil).
+ *
+ * ceil is used on the required remaining supply so the post-withdraw utilization never rounds
+ * *above* the target. Returns 0 when the market is already at/above the target utilization
+ * (the caller should then wait for borrowers to repay). With zero borrows the whole supply is
+ * withdrawable. This is a stricter cap than "all idle liquidity" (which would allow util → 100%).
+ */
+export function maxWithdrawableForUtilization(
+  totalSupplyAssets: bigint,
+  totalBorrowAssets: bigint,
+  maxUtilizationBps: number,
+): bigint {
+  if (totalBorrowAssets <= 0n) return totalSupplyAssets;
+  if (maxUtilizationBps <= 0) return 0n;
+  const util = BigInt(maxUtilizationBps);
+  // ceil(borrow * 10000 / maxUtilBps)
+  const minSupplyAfter = (totalBorrowAssets * 10000n + util - 1n) / util;
+  return totalSupplyAssets > minSupplyAfter ? totalSupplyAssets - minSupplyAfter : 0n;
+}
+
+/**
  * Compute the allocation/deallocation actions needed to reach target per-market allocations.
  *
  * For allocations, the returned amounts are approximate (based on the initial state read).
@@ -132,6 +221,7 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
     totalAssets,
     perMarketAssets,
     targetPerMarketBpsByIndex,
+    targetPerMarketAmountsByIndex,
     rebalanceThresholdBps,
     minSweepAmount = 0n,
   } = input;
@@ -139,6 +229,11 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
   if (targetPerMarketBpsByIndex.length !== perMarketAssets.length) {
     throw new Error(
       `targetPerMarketBpsByIndex length (${targetPerMarketBpsByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
+    );
+  }
+  if (targetPerMarketAmountsByIndex !== undefined && targetPerMarketAmountsByIndex.length !== perMarketAssets.length) {
+    throw new Error(
+      `targetPerMarketAmountsByIndex length (${targetPerMarketAmountsByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
     );
   }
 
@@ -158,7 +253,11 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
   for (let i = 0; i < perMarketAssets.length; i++) {
     const current = perMarketAssets[i];
     const targetBps = targetPerMarketBpsByIndex[i];
-    const targetPerMarket = (totalAssets * BigInt(targetBps)) / 10000n;
+    // Effective target amount: an explicit per-market amount (e.g. absolute-cap redistribution)
+    // takes precedence over the bps-derived amount when supplied.
+    const targetPerMarket = targetPerMarketAmountsByIndex !== undefined
+      ? targetPerMarketAmountsByIndex[i]
+      : (totalAssets * BigInt(targetBps)) / 10000n;
 
     const diff = current > targetPerMarket ? current - targetPerMarket : targetPerMarket - current;
     const devBps = Number((diff * 10000n) / totalAssets);
@@ -324,6 +423,11 @@ export interface MarketLiquidity {
   marketIndex: number;
   totalSupplyAssets: bigint;
   totalBorrowAssets: bigint;
+  // Optional per-market max utilization (bps, e.g. 9300 = 93%). When set, the withdrawal is
+  // capped so post-withdraw utilization stays <= this, instead of using the supply-reserve
+  // cushion. Used for markets being drained (e.g. WETH/USDS): withdraw up to 93% utilization
+  // and skip (wait) once the market is already at/above it.
+  maxUtilizationBps?: number;
 }
 
 export interface CappedAction {
@@ -364,8 +468,16 @@ export function capDeallocationsToLiquidity(
       ? ml.totalSupplyAssets - ml.totalBorrowAssets
       : 0n;
 
-    const reserve = ml.totalSupplyAssets * LIQUIDITY_RESERVE_PERCENT / 100n;
-    const maxWithdrawable = liquidity > reserve ? liquidity - reserve : 0n;
+    // Two withdrawal-cushion models:
+    //  - maxUtilizationBps set (drained markets, e.g. WETH): cap so post-withdraw utilization
+    //    stays <= that target; yields 0 (wait) once the market is already at/above it.
+    //  - otherwise: reserve LIQUIDITY_RESERVE_PERCENT of totalSupply as a flat cushion.
+    const maxWithdrawable = ml.maxUtilizationBps !== undefined
+      ? maxWithdrawableForUtilization(ml.totalSupplyAssets, ml.totalBorrowAssets, ml.maxUtilizationBps)
+      : (() => {
+          const reserve = ml.totalSupplyAssets * LIQUIDITY_RESERVE_PERCENT / 100n;
+          return liquidity > reserve ? liquidity - reserve : 0n;
+        })();
 
     if (maxWithdrawable === 0n) {
       return { marketIndex: a.marketIndex, amount: 0n, capped: false, skipped: true, availableLiquidity: liquidity };

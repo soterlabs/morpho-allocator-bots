@@ -2,9 +2,12 @@
  * Flagship Vault V2 Allocator Bot
  *
  * This bot maintains the 80% idle / 20% allocated strategy for the Flagship USDS Vault.
- * It allocates across 4 markets: stUSDS, cbBTC, wstETH, WETH (all with USDS as loan token).
- * Each market has its own target in basis points (default 5% each, sum = 20%), overridable
- * via TARGET_<MARKET>_BPS env vars to support asymmetric targets / deallocation migrations.
+ * It allocates across 5 markets: stUSDS, cbBTC, wstETH, PT-sUSDS, WETH (all with USDS as loan
+ * token). Each market has its own target in basis points, overridable via TARGET_<MARKET>_BPS.
+ * Current scheme retires stUSDS and WETH to 0% and targets ~6.66% each on cbBTC/wstETH/PT-sUSDS
+ * (667/667/666 = 2000). PT-sUSDS additionally has a 5M USDS absolute cap enforced off-chain by
+ * the bot; overflow above the cap is split equally between cbBTC and wstETH. WETH is drained
+ * only up to 93% market utilization (waits above it).
  *
  * Transactions are executed through a Safe 1/3 multisig. The bot is one of the 3 signers
  * and can execute autonomously since the threshold is 1.
@@ -24,7 +27,7 @@ import { createPublicClient, createWalletClient, http, formatEther, parseEther, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, parseTargetBps, validateTargetBpsSum, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, parseTargetBps, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 
 // ============ CONFIGURATION ============
 
@@ -64,48 +67,83 @@ interface MarketConfig {
   // Per-market target allocation in basis points (10000 = 100%).
   // Sum across all configured markets must equal config.targetAllocatedPercent.
   targetBps: number;
+  // Optional absolute cap (in USDS) on this market's allocated amount, enforced off-chain by
+  // the bot (not a market/vault param). When the bps target exceeds this, the market is held
+  // at the cap and the overflow is redistributed to overflowReceiver markets. Used by
+  // PT-sUSDS/USDS (5M cap).
+  absoluteCap?: bigint;
+  // When true, this market absorbs an equal share of overflow from absolute-capped markets on
+  // top of its own bps target. Set on cbBTC/USDS and wstETH/USDS to soak up PT-sUSDS overflow.
+  overflowReceiver?: boolean;
+  // Optional max utilization (bps) for deallocations from this market. When set, withdrawals
+  // are capped so post-withdraw utilization stays <= this (and skipped/waited once already
+  // at/above it) instead of the flat supply-reserve cushion. Set on WETH/USDS (9300 = 93%).
+  maxUtilizationBps?: number;
   encodedParams?: Hex;
 }
 
-// All markets use 86% LLTV per BA Labs recommendation (02/02/2026)
+// Most markets use 86% LLTV per BA Labs recommendation (02/02/2026). PT-sUSDS/USDS uses 91.5%.
 const LLTV_86_PERCENT = '860000000000000000';
+const LLTV_91_5_PERCENT = '915000000000000000';
 
 // Existing stUSDS oracle from USDS vault deployment
 const EXISTING_STUSDS_ORACLE = '0x0A976226d113B67Bd42D672Ac9f83f92B44b454C';
+// PT-sUSDS/USDS market oracle (MorphoChainlinkOracleV2). See soterlabs/morpho-market-pt-susds.
+const PT_SUSDS_ORACLE = '0xda5901EF31ecAFa6561B2e56B4997FAdd3dB4646';
 
-// Per-market target defaults (basis points). Override via env vars.
-// Legacy default is 500 (5%) each, matching the original 5/5/5/5 = 20% scheme.
-// For the stUSDS+WETH deallocation migration, set TARGET_STUSDS_BPS=0 TARGET_WETH_BPS=0
-// TARGET_CBBTC_BPS=1000 TARGET_WSTETH_BPS=1000 (sum still equals targetAllocatedPercent=2000).
-const DEFAULT_TARGET_BPS = 500;
+// PT-sUSDS/USDS absolute allocation cap (5M USDS), enforced off-chain by the bot. When the
+// market's bps target exceeds this, PT-sUSDS is held at 5M and the overflow is split equally
+// between cbBTC/USDS and wstETH/USDS. Override via env PT_SUSDS_ABSOLUTE_CAP_USDS.
+const PT_SUSDS_ABSOLUTE_CAP = parseEther(process.env.PT_SUSDS_ABSOLUTE_CAP_USDS || '5000000');
+
+// Max utilization (bps) the bot will push a drained market to when withdrawing. WETH/USDS is
+// being retired to 0%; we withdraw only up to 93% utilization and wait above it. Override via
+// env WETH_MAX_UTILIZATION_BPS.
+const WETH_MAX_UTILIZATION_BPS = parseTargetBps(process.env.WETH_MAX_UTILIZATION_BPS, 9300, 'WETH_MAX_UTILIZATION_BPS');
+
+// Per-market target defaults (basis points). Override via env vars. Current scheme retires
+// stUSDS and WETH to 0% and splits the 20% allocated target across cbBTC/wstETH/PT-sUSDS
+// (~6.66% each: 667/667/666, so the five-market sum is exactly 2000). PT-sUSDS
+// is additionally bounded by its 5M absolute cap, with overflow going to cbBTC and wstETH.
 const markets: MarketConfig[] = [
   {
     name: 'stUSDS/USDS',
     collateral: '0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9' as Address,
     oracle: (process.env.ORACLE_STUSDS || EXISTING_STUSDS_ORACLE) as Address,
     lltv: BigInt(process.env.LLTV_STUSDS || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_STUSDS_BPS, DEFAULT_TARGET_BPS, 'TARGET_STUSDS_BPS'),
+    targetBps: parseTargetBps(process.env.TARGET_STUSDS_BPS, 0, 'TARGET_STUSDS_BPS'),
   },
   {
     name: 'cbBTC/USDS',
     collateral: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' as Address,
     oracle: (process.env.ORACLE_CBBTC || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_CBBTC || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_CBBTC_BPS, DEFAULT_TARGET_BPS, 'TARGET_CBBTC_BPS'),
+    targetBps: parseTargetBps(process.env.TARGET_CBBTC_BPS, 667, 'TARGET_CBBTC_BPS'),
+    overflowReceiver: true,
   },
   {
     name: 'wstETH/USDS',
     collateral: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0' as Address,
     oracle: (process.env.ORACLE_WSTETH || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_WSTETH || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_WSTETH_BPS, DEFAULT_TARGET_BPS, 'TARGET_WSTETH_BPS'),
+    targetBps: parseTargetBps(process.env.TARGET_WSTETH_BPS, 667, 'TARGET_WSTETH_BPS'),
+    overflowReceiver: true,
+  },
+  {
+    name: 'PT-sUSDS/USDS',
+    collateral: '0xdC169AbE56461A2E0c034Da431Ac2a3ebf596094' as Address,
+    oracle: (process.env.ORACLE_PTSUSDS || PT_SUSDS_ORACLE) as Address,
+    lltv: BigInt(process.env.LLTV_PTSUSDS || LLTV_91_5_PERCENT),
+    targetBps: parseTargetBps(process.env.TARGET_PTSUSDS_BPS, 666, 'TARGET_PTSUSDS_BPS'),
+    absoluteCap: PT_SUSDS_ABSOLUTE_CAP,
   },
   {
     name: 'WETH/USDS',
     collateral: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' as Address,
     oracle: (process.env.ORACLE_WETH || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_WETH || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, DEFAULT_TARGET_BPS, 'TARGET_WETH_BPS'),
+    targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, 0, 'TARGET_WETH_BPS'),
+    maxUtilizationBps: WETH_MAX_UTILIZATION_BPS,
   },
 ];
 
@@ -654,12 +692,31 @@ async function main() {
     log(`  ${configuredMarkets[i].name}: ${formatEther(perMarketAssets[i])} USDS`);
   }
 
+  // Compute effective per-market target AMOUNTS. This applies PT-sUSDS's 5M absolute cap and
+  // redistributes any overflow equally to the overflowReceiver markets (cbBTC, wstETH), so the
+  // targets can't be expressed as static bps once the cap binds. computeAllocationActions
+  // consumes these amounts; the base bps are still passed for the target-0 retired-sweep logic.
+  const targetSpecs: MarketTargetSpec[] = configuredMarkets.map(m => ({
+    baseBps: m.targetBps,
+    absoluteCap: m.absoluteCap,
+    overflowReceiver: m.overflowReceiver,
+  }));
+  const effectiveTargetAmounts = computeEffectiveTargetAmounts(totalAssets, targetSpecs);
+
+  const cappedMarkets = configuredMarkets.filter(m =>
+    m.absoluteCap !== undefined && (totalAssets * BigInt(m.targetBps)) / 10000n > m.absoluteCap);
+  if (cappedMarkets.length > 0) {
+    log('Effective targets (absolute cap applied, overflow redistributed):',
+      configuredMarkets.map((m, i) => `${m.name}: ${formatEther(effectiveTargetAmounts[i])} USDS`));
+  }
+
   // Compute per-market allocation/deallocation actions
   const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
     totalAssets,
     perMarketAssets,
     targetPerMarketBpsByIndex,
+    targetPerMarketAmountsByIndex: effectiveTargetAmounts,
     rebalanceThresholdBps: config.rebalanceThresholdBps,
     // Sweep retired (target-0) markets down to the dust floor even when their deviation
     // is below the bps threshold, so leftover funds are returned to the vault rather than
@@ -744,28 +801,40 @@ async function main() {
     });
   }
 
-  // Per-market effective cap (with headroom), computed once and reused below. Each cap is
-  // clamped to the vault's on-chain relative cap: if the cap hasn't been raised to the
-  // target yet, allocating to the full target would revert (RelativeCapExceeded) and,
-  // because the batch is atomic, take the deallocations down with it. Clamping lets the
-  // bot allocate up to whatever cap is currently live and converge as caps are raised.
+  // Per-market effective cap (with headroom), computed once and reused below. The cap target is
+  // the market's effective target AMOUNT (bps target with PT-sUSDS's 5M absolute cap applied and
+  // overflow redistributed), clamped to the vault's live on-chain relative cap: if the on-chain
+  // cap hasn't been raised to the target yet, allocating to the full target would revert
+  // (RelativeCapExceeded) and, because the batch is atomic, take the deallocations down with it.
+  // Clamping lets the bot allocate up to whatever cap is currently live and converge as caps rise.
+  const freshEffectiveTargets = computeEffectiveTargetAmounts(freshTotalAssets, targetSpecs);
   const allocateCapInfo = allocateActions.map(a => {
     const market = configuredMarkets[a.marketIndex];
-    const targetCapWad = bpsToWad(market.targetBps);
+    const targetAmount = freshEffectiveTargets[a.marketIndex];
     const onchainCapWad = onchainRelativeCapWadByIndex.get(a.marketIndex);
-    const capWad = onchainCapWad !== undefined && onchainCapWad < targetCapWad ? onchainCapWad : targetCapWad;
-    const capLimit = computeCapLimit(freshTotalAssets, capWad);
+    const onchainCapLimit = onchainCapWad !== undefined
+      ? computeCapLimit(freshTotalAssets, onchainCapWad)
+      : targetAmount;
+    const capLimit = onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
     const effectiveCap = capLimit - capLimit * CAP_HEADROOM_BPS / 10000n;
-    return { marketIndex: a.marketIndex, market, effectiveCap, capWad, clamped: capWad !== targetCapWad };
+    return {
+      marketIndex: a.marketIndex,
+      market,
+      effectiveCap,
+      onchainCapWad,
+      targetAmount,
+      clamped: onchainCapLimit < targetAmount,
+    };
   });
 
   // Warn when a market's on-chain relative cap is below its target — allocations are
   // clamped to the live cap, so the market can't reach target until the cap is raised.
   for (const info of allocateCapInfo) {
     if (info.clamped) {
-      const onchainBps = Number((info.capWad * 10000n) / 10n ** 18n);
-      log(`WARNING: ${info.market.name} on-chain relative cap is ${onchainBps} bps but target is ${info.market.targetBps} bps — ` +
-          `allocations are clamped to the on-chain cap. Raise the cap (increaseRelativeCap) to reach target.`);
+      const onchainBps = info.onchainCapWad !== undefined ? Number((info.onchainCapWad * 10000n) / 10n ** 18n) : 0;
+      log(`WARNING: ${info.market.name} on-chain relative cap is ${onchainBps} bps but effective target is ` +
+          `${formatEther(info.targetAmount)} USDS (${info.market.targetBps} bps base) — allocations are clamped ` +
+          `to the on-chain cap. Raise the cap (increaseRelativeCap) to reach target.`);
     }
   }
 
@@ -788,7 +857,14 @@ async function main() {
 
     const marketLiquidityData: MarketLiquidity[] = deallocateActions.map((a, i) => {
       const [totalSupplyAssets, , totalBorrowAssets] = marketStates[i];
-      return { marketIndex: a.marketIndex, totalSupplyAssets, totalBorrowAssets };
+      // WETH/USDS (and any market with maxUtilizationBps set) is drained only up to its target
+      // utilization (93%), waiting above it; others use the flat supply-reserve cushion.
+      return {
+        marketIndex: a.marketIndex,
+        totalSupplyAssets,
+        totalBorrowAssets,
+        maxUtilizationBps: configuredMarkets[a.marketIndex].maxUtilizationBps,
+      };
     });
 
     cappedDeallocations = capDeallocationsToLiquidity(deallocateActions, marketLiquidityData);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
@@ -1133,5 +1133,179 @@ describe('capAllocationsToBudget', () => {
     const out = capAllocationsToBudget(allocs, eth('500'), MIN);
     expect(out.map(a => a.marketIndex)).toEqual([1]);
     expect(out[0].amount).toBeLessThanOrEqual(eth('500'));
+  });
+});
+
+describe('computeEffectiveTargetAmounts (PT-sUSDS absolute cap + overflow redistribution)', () => {
+  // Flagship 5-market layout order used by the bot:
+  //   [stUSDS(0bps), cbBTC(667,receiver), wstETH(667,receiver), PT-sUSDS(666,cap 5M), WETH(0bps)]
+  const CAP_5M = eth('5000000');
+  const specs = (): MarketTargetSpec[] => [
+    { baseBps: 0 },
+    { baseBps: 667, overflowReceiver: true },
+    { baseBps: 667, overflowReceiver: true },
+    { baseBps: 666, absoluteCap: CAP_5M },
+    { baseBps: 0 },
+  ];
+
+  it('leaves targets untouched when PT-sUSDS is under its 5M cap', () => {
+    // totalAssets 38.7M → PT target 6.66% ≈ 2.577M < 5M, so no cap binds, no redistribution.
+    const total = eth('38700000');
+    const eff = computeEffectiveTargetAmounts(total, specs());
+    expect(eff[0]).toBe(0n);
+    expect(eff[1]).toBe((total * 667n) / 10000n);   // cbBTC base
+    expect(eff[2]).toBe((total * 667n) / 10000n);   // wstETH base
+    expect(eff[3]).toBe((total * 666n) / 10000n);   // PT base (uncapped)
+    expect(eff[4]).toBe(0n);
+    expect(eff[3]).toBeLessThan(CAP_5M);
+  });
+
+  it('caps PT-sUSDS at 5M and splits the overflow equally between cbBTC and wstETH', () => {
+    // totalAssets 100M → PT base 6.66% = 6.66M, over the 5M cap by 1.66M.
+    const total = eth('100000000');
+    const eff = computeEffectiveTargetAmounts(total, specs());
+    const ptBase = (total * 666n) / 10000n;         // 6.66M
+    const overflow = ptBase - CAP_5M;               // 1.66M
+    expect(overflow).toBeGreaterThan(0n);
+
+    expect(eff[3]).toBe(CAP_5M);                     // PT held at the 5M cap
+    // Overflow split equally onto the two receivers' base targets.
+    expect(eff[1]).toBe((total * 667n) / 10000n + overflow / 2n);
+    expect(eff[2]).toBe((total * 667n) / 10000n + overflow / 2n);
+    expect(eff[0]).toBe(0n);
+    expect(eff[4]).toBe(0n);
+
+    // The whole 20% allocated target is preserved (nothing lost to the cap).
+    const sum = eff.reduce((a, b) => a + b, 0n);
+    expect(sum).toBe((total * 2000n) / 10000n);
+  });
+
+  it('conserves the total exactly when overflow is odd (1-wei remainder to earliest receiver)', () => {
+    // Base amounts at totalAssets=3: [1, 1, 3]. The third market is capped to 0, producing an
+    // odd overflow of 3 that must split across the two receivers as 2 + 1 (remainder to first).
+    const specsOdd: MarketTargetSpec[] = [
+      { baseBps: 5000, overflowReceiver: true },   // base 1
+      { baseBps: 5000, overflowReceiver: true },   // base 1
+      { baseBps: 10000, absoluteCap: 0n },         // base 3, capped to 0 → overflow 3
+    ];
+    const total = 3n;
+    const eff = computeEffectiveTargetAmounts(total, specsOdd);
+    expect(eff[2]).toBe(0n);
+    expect(eff[0]).toBe(3n); // base 1 + share 1 + remainder 1
+    expect(eff[1]).toBe(2n); // base 1 + share 1
+    // No units lost or created: the receivers absorbed the full pre-cap total (1+1+3 = 5).
+    expect(eff[0] + eff[1] + eff[2]).toBe(5n);
+  });
+
+  it('leaves overflow unallocated when there is no receiver', () => {
+    const noReceiver: MarketTargetSpec[] = [
+      { baseBps: 1000, absoluteCap: eth('100') }, // base 1000 bps of 10000 = 1000; capped to 100
+      { baseBps: 0 },
+    ];
+    const total = eth('10000');
+    const eff = computeEffectiveTargetAmounts(total, noReceiver);
+    expect(eff[0]).toBe(eth('100')); // held at cap; overflow (900) simply dropped
+    expect(eff[1]).toBe(0n);
+  });
+
+  it('feeds computeAllocationActions so a capped PT overflow grows cbBTC/wstETH targets', () => {
+    // At 100M, PT is capped; the extra target lands on cbBTC/wstETH. Starting from all-zero
+    // positions, the bot should try to allocate the (redistributed) target amounts.
+    const total = eth('100000000');
+    const eff = computeEffectiveTargetAmounts(total, specs());
+    const result = computeAllocationActions({
+      totalAssets: total,
+      perMarketAssets: [0n, 0n, 0n, 0n, 0n],
+      targetPerMarketBpsByIndex: [0, 667, 667, 666, 0],
+      targetPerMarketAmountsByIndex: eff,
+      rebalanceThresholdBps: 100,
+    });
+    expect(result.skipped).toBe(false);
+    const alloc = new Map(result.actions.filter(a => a.action === 'allocate').map(a => [a.marketIndex, a.amount]));
+    // PT allocation is exactly the 5M cap; cbBTC/wstETH each carry base + overflow/2 (> 5M each? no—
+    // base 6.67M + 0.83M = 7.5M), and are strictly greater than the uncapped PT cap target.
+    expect(alloc.get(3)).toBe(CAP_5M);
+    expect(alloc.get(1)).toBe(eff[1]);
+    expect(alloc.get(2)).toBe(eff[2]);
+    expect(alloc.get(1)!).toBeGreaterThan(CAP_5M);
+  });
+});
+
+describe('maxWithdrawableForUtilization', () => {
+  it('withdraws everything when there are no borrows', () => {
+    expect(maxWithdrawableForUtilization(eth('1000'), 0n, 9300)).toBe(eth('1000'));
+  });
+
+  it('caps withdrawal so post-withdraw utilization equals the target (93%)', () => {
+    // supply 1000, borrow 500 → current util 50%. Withdraw W so 500/(1000-W) <= 93%.
+    // minSupplyAfter = ceil(500*10000/9300) = ceil(537634.4...) wei-scale → for round numbers:
+    const supply = eth('1000');
+    const borrow = eth('500');
+    const w = maxWithdrawableForUtilization(supply, borrow, 9300);
+    // After withdrawing w, utilization must be <= 93% (never above, due to ceil).
+    const supplyAfter = supply - w;
+    // borrow / supplyAfter <= 0.93  <=>  borrow*10000 <= 9300*supplyAfter
+    expect(borrow * 10000n <= 9300n * supplyAfter).toBe(true);
+    // And it should be right at the boundary: withdrawing 1 more wei would break 93%.
+    const supplyAfterPlus1 = supplyAfter - 1n;
+    expect(borrow * 10000n <= 9300n * supplyAfterPlus1).toBe(false);
+  });
+
+  it('returns 0 (wait) when the market is already at or above 93% utilization', () => {
+    // supply 1000, borrow 950 → util 95% > 93%.
+    expect(maxWithdrawableForUtilization(eth('1000'), eth('950'), 9300)).toBe(0n);
+    // exactly at 93%: borrow 930, supply 1000 → util exactly 93%, nothing withdrawable.
+    expect(maxWithdrawableForUtilization(eth('1000'), eth('930'), 9300)).toBe(0n);
+  });
+
+  it('is stricter than withdrawing all idle liquidity', () => {
+    const supply = eth('1000');
+    const borrow = eth('800'); // idle = 200
+    const w = maxWithdrawableForUtilization(supply, borrow, 9300);
+    expect(w).toBeGreaterThan(0n);
+    expect(w).toBeLessThan(supply - borrow); // less than the full 200 idle
+  });
+});
+
+describe('capDeallocationsToLiquidity with per-market maxUtilizationBps', () => {
+  it('uses the 93% utilization cap instead of the flat reserve when set', () => {
+    // supply 1000, borrow 800. Reserve model would allow (idle 200 - 5% of 1000 = 150).
+    // Utilization model (93%) allows supply - ceil(800*10000/9300).
+    const actions: AllocationAction[] = [{ marketIndex: 4, action: 'deallocate', amount: eth('1000') }];
+    const ml: MarketLiquidity[] = [{
+      marketIndex: 4,
+      totalSupplyAssets: eth('1000'),
+      totalBorrowAssets: eth('800'),
+      maxUtilizationBps: 9300,
+    }];
+    const [out] = capDeallocationsToLiquidity(actions, ml);
+    const expected = maxWithdrawableForUtilization(eth('1000'), eth('800'), 9300);
+    expect(out.amount).toBe(expected);
+    expect(out.capped).toBe(true);
+    expect(out.skipped).toBe(false);
+    // Differs from the reserve model (which would give idle - 5% supply = 150).
+    expect(out.amount).not.toBe(eth('150'));
+  });
+
+  it('skips (waits) when utilization is already at/above 93%', () => {
+    const actions: AllocationAction[] = [{ marketIndex: 4, action: 'deallocate', amount: eth('1000') }];
+    const ml: MarketLiquidity[] = [{
+      marketIndex: 4,
+      totalSupplyAssets: eth('1000'),
+      totalBorrowAssets: eth('950'),
+      maxUtilizationBps: 9300,
+    }];
+    const [out] = capDeallocationsToLiquidity(actions, ml);
+    expect(out.amount).toBe(0n);
+    expect(out.skipped).toBe(true);
+  });
+
+  it('still uses the reserve model for markets without maxUtilizationBps', () => {
+    // No maxUtilizationBps → flat 5% reserve. supply 1000, borrow 0 → idle 1000, reserve 50.
+    const actions: AllocationAction[] = [{ marketIndex: 1, action: 'deallocate', amount: eth('1000') }];
+    const ml: MarketLiquidity[] = [{ marketIndex: 1, totalSupplyAssets: eth('1000'), totalBorrowAssets: 0n }];
+    const [out] = capDeallocationsToLiquidity(actions, ml);
+    const reserve = eth('1000') * LIQUIDITY_RESERVE_PERCENT / 100n;
+    expect(out.amount).toBe(eth('1000') - reserve);
   });
 });
