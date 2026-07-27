@@ -400,12 +400,23 @@ async function main() {
   );
   log(`Transaction submitted via Safe: ${hash}`);
 
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  log(`Confirmed in block ${receipt.blockNumber}, status: ${receipt.status}`);
-  // Surface an on-chain revert as a failure (non-zero exit via the outer catch) instead of a
-  // silent no-op, so a blocked migration doesn't look like a successful cron run.
-  if (receipt.status !== 'success') {
-    throw new Error(`migration transaction ${hash} reverted on-chain (status: ${receipt.status})`);
+  // Wait for confirmation, but do NOT treat a confirmation-wait *timeout* as a failure: the tx is
+  // already broadcast and will typically confirm shortly after. Only a genuine on-chain revert is
+  // a hard (non-zero exit) failure. viem's default wait timeout is 180s, which mainnet congestion
+  // can exceed — so we extend it and downgrade a timeout to a warning (the next 6h run reconciles
+  // from on-chain state). Otherwise a successful-but-slow migration crashes the cron deployment.
+  try {
+    const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 600_000, pollingInterval: 4_000 });
+    log(`Confirmed in block ${receipt.blockNumber}, status: ${receipt.status}`);
+    if (receipt.status !== 'success') {
+      throw new Error(`migration transaction ${hash} reverted on-chain (status: ${receipt.status})`);
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('reverted on-chain')) throw error; // genuine revert -> fail loudly
+    log(`WARNING: submitted ${hash} but did not observe confirmation within the wait window ` +
+        `(${msg.split('\n')[0]}). The transaction may still confirm on-chain; the next scheduled ` +
+        `run reconciles from on-chain state. Not failing this run.`);
   }
 
   // Final state.
