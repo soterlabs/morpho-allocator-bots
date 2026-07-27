@@ -84,8 +84,9 @@ it. See [`usdt-savings/README.md`](usdt-savings/README.md). **USDT has 6 decimal
 | Role | Address |
 | --- | --- |
 | Vault (Morpho Vault V2) | [`0x23f5E9c35820f4baB695Ac1F19c203cC3f8e1e11`](https://etherscan.io/address/0x23f5E9c35820f4baB695Ac1F19c203cC3f8e1e11) |
-| Vault adapter | _set per-service (`ADAPTER_ADDRESS`)_ |
-| Allocator — Safe (holds the vault's `Allocator` role; bot signs through it) | _set per-service (`SAFE_ADDRESS`)_ |
+| Vault adapter | [`0x6C5D5D47A39FE9f8CA14731a9A42bD31d64fb40D`](https://etherscan.io/address/0x6C5D5D47A39FE9f8CA14731a9A42bD31d64fb40D) |
+| Allocator — msig (holds the vault's `Allocator` role, threshold 1; bot signs through it) | [`0xa1d2D1ad14D2f8819a06eEe8438ec5A5C780e3aE`](https://etherscan.io/address/0xa1d2D1ad14D2f8819a06eEe8438ec5A5C780e3aE) |
+| Bot signer (EOA; owner of the allocator msig) | [`0xaf64ad999d65da1cecec2e694ce9caccc423d72a`](https://etherscan.io/address/0xaf64ad999d65da1cecec2e694ce9caccc423d72a) |
 | Loan token — USDT (6 dp) | [`0xdAC17F958D2ee523a2206206994597C13D831ec7`](https://etherscan.io/address/0xdAC17F958D2ee523a2206206994597C13D831ec7) |
 | Collateral — sUSDS | [`0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD`](https://etherscan.io/address/0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD) |
 
@@ -95,8 +96,8 @@ it. See [`usdt-savings/README.md`](usdt-savings/README.md). **USDT has 6 decimal
 | New sUSDS/USDT | allocate to | `0x26b1…4d96` | `0x1C7DBd…2F9C` (USDS/USD, capped USDT) | 96.5% |
 
 > The Sky.money curator msig `0x3F32bC09d41eE699844F8296e806417D6bf61Bba` is the vault's
-> owner/curator. The bot executes through a separate bot-controlled **Safe** (set as an
-> allocator on the vault) via `SAFE_ADDRESS`.
+> owner/curator. The bot executes through the separate bot-controlled allocator msig above
+> (threshold 1, bot EOA as owner) via `SAFE_ADDRESS` — all verified on-chain.
 
 ---
 
