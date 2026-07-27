@@ -103,7 +103,7 @@ const WETH_MAX_UTILIZATION_BPS = parseTargetBps(process.env.WETH_MAX_UTILIZATION
 
 // Per-market target defaults (basis points). Override via env vars. Current scheme retires
 // stUSDS and WETH to 0% and splits the 20% allocated target across cbBTC/wstETH/PT-sUSDS
-// (~6.66% each: 667/667/666 so the four-market... five-market sum is exactly 2000). PT-sUSDS
+// (~6.66% each: 667/667/666, so the five-market sum is exactly 2000). PT-sUSDS
 // is additionally bounded by its 5M absolute cap, with overflow going to cbBTC and wstETH.
 const markets: MarketConfig[] = [
   {
@@ -703,7 +703,7 @@ async function main() {
   }));
   const effectiveTargetAmounts = computeEffectiveTargetAmounts(totalAssets, targetSpecs);
 
-  const cappedMarkets = configuredMarkets.filter((m, i) =>
+  const cappedMarkets = configuredMarkets.filter(m =>
     m.absoluteCap !== undefined && (totalAssets * BigInt(m.targetBps)) / 10000n > m.absoluteCap);
   if (cappedMarkets.length > 0) {
     log('Effective targets (absolute cap applied, overflow redistributed):',

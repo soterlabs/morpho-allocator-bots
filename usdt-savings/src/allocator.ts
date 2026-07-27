@@ -359,24 +359,53 @@ async function main() {
     return;
   }
 
+  // Pre-flight: simulate the exact batch as the allocator Safe before submitting. Old→new is a
+  // same-collateral swap so it shouldn't hit the vault's caps, but this catches any blocker
+  // (market not enabled, caps not raised, or a liquidity shortfall) and turns a would-be
+  // on-chain revert — which, because the batch is atomic, would otherwise just waste gas and
+  // silently stall the migration — into a clear, non-zero-exit failure. This avoids guessing
+  // this vault's cap-id scheme (old and new share the sUSDS collateral). Best-effort: if the
+  // RPC doesn't support eth_simulateV1 we log and fall through to submission.
   try {
-    const packed = packMultiSendTxs(vaultCalls.map(c => ({ to: config.vaultAddress, data: c.calldata })));
-    const multiSendData = encodeFunctionData({
-      abi: [{ name: 'multiSend', type: 'function', stateMutability: 'payable', inputs: [{ name: 'transactions', type: 'bytes' }], outputs: [] }] as const,
-      functionName: 'multiSend',
-      args: [packed],
+    const sim = await publicClient.simulateCalls({
+      account: config.safeAddress,
+      calls: vaultCalls.map(c => ({ to: config.vaultAddress, data: c.calldata })),
+      stateOverrides: [{ address: config.safeAddress, balance: 100n * 10n ** 18n }],
     });
-
-    const hash = await executeSafeTransaction(
-      publicClient, walletClient, account, config.safeAddress, MULTISEND, multiSendData,
-      1, // DELEGATECALL — MultiSend runs as the Safe, so the vault sees msg.sender = Safe
-    );
-    log(`Transaction submitted via Safe: ${hash}`);
-
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    log(`Confirmed in block ${receipt.blockNumber}, status: ${receipt.status}`);
+    const failed = sim.results.findIndex(r => r.status !== 'success');
+    if (failed !== -1) {
+      const r = sim.results[failed];
+      const err = r.error as { shortMessage?: string; message?: string } | undefined;
+      const reason = (err && (err.shortMessage || err.message)) || 'reverted';
+      log(`WARNING: migration batch would revert at "${vaultCalls[failed].name}": ${reason}. ` +
+          `The migration may be BLOCKED (market not enabled, caps not raised, or insufficient ` +
+          `liquidity) — not submitting.`);
+      process.exit(1);
+    }
+    log('Pre-flight simulation passed — submitting.');
   } catch (error) {
-    log(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
+    log(`Pre-flight simulation unavailable (${(error instanceof Error ? error.message : String(error)).split('\n')[0]}); proceeding to submit.`);
+  }
+
+  const packed = packMultiSendTxs(vaultCalls.map(c => ({ to: config.vaultAddress, data: c.calldata })));
+  const multiSendData = encodeFunctionData({
+    abi: [{ name: 'multiSend', type: 'function', stateMutability: 'payable', inputs: [{ name: 'transactions', type: 'bytes' }], outputs: [] }] as const,
+    functionName: 'multiSend',
+    args: [packed],
+  });
+
+  const hash = await executeSafeTransaction(
+    publicClient, walletClient, account, config.safeAddress, MULTISEND, multiSendData,
+    1, // DELEGATECALL — MultiSend runs as the Safe, so the vault sees msg.sender = Safe
+  );
+  log(`Transaction submitted via Safe: ${hash}`);
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  log(`Confirmed in block ${receipt.blockNumber}, status: ${receipt.status}`);
+  // Surface an on-chain revert as a failure (non-zero exit via the outer catch) instead of a
+  // silent no-op, so a blocked migration doesn't look like a successful cron run.
+  if (receipt.status !== 'success') {
+    throw new Error(`migration transaction ${hash} reverted on-chain (status: ${receipt.status})`);
   }
 
   // Final state.

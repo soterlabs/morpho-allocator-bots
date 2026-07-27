@@ -124,7 +124,7 @@ crontab -e
 3. **Read current state** — Gets total assets, adapter total, idle balance
 4. **Read per-market balances** — Calls `adapter.expectedSupplyAssets(marketId)` for each market
 5. **Compute per-market actions** — Only allocate/deallocate markets that are off-target. Skips (no transaction) only when *every* market's deviation from its own target is below the threshold — so asymmetric migrations still fire even when the aggregate allocated total already matches target
-6. **Check market liquidity** — For deallocations, reads Morpho Blue market state and caps amounts to available liquidity (minus 5% reserve)
+6. **Check market liquidity** — For deallocations, reads Morpho Blue market state and caps amounts to available liquidity (minus a 5% reserve — except WETH/USDS, which is capped to a 93% max-utilization target instead)
 7. **Execute via Safe** — Signs and executes through the Safe multisig with a 50% gas buffer
 8. **Log results** — Reports final state
 
@@ -159,7 +159,7 @@ Before: [7.5%, 7.5%, 7.5%, 7.5%]  → Actions: deallocate 2.5% from each
 After:  [5%, 5%, 5%, 5%]           (20% total)
 ```
 
-**Liquidity-constrained deallocations:** If a Morpho Blue market has high utilization, the bot may not be able to withdraw the full desired amount. In that case, the deallocate is capped to available liquidity minus a 5% reserve (to avoid pushing utilization to 100%), or skipped entirely if the market is at ≥95% utilization. This can leave the vault temporarily imbalanced (e.g. 7%/3%/5%/5% instead of 5/5/5/5) and the overall allocation above the 20% target. The bot self-heals over subsequent runs as market liquidity improves.
+**Liquidity-constrained deallocations:** If a Morpho Blue market has high utilization, the bot may not be able to withdraw the full desired amount. In that case, the deallocate is capped to available liquidity minus a 5% reserve (to avoid pushing utilization to 100%), or skipped entirely if the market is at ≥95% utilization. **A market with an explicit max-utilization target (currently WETH/USDS at 93%, via `maxUtilizationBps`) uses that instead of the flat reserve: the withdrawal is capped so post-withdraw utilization stays ≤ 93%, and skipped (waiting for borrowers to repay) once already at/above it.** This can leave the vault temporarily imbalanced and the overall allocation above the 20% target. The bot self-heals over subsequent runs as market liquidity improves.
 
 ### Case 5: Mixed (some over, some under)
 Some markets are above target, others below. The bot issues both allocate and deallocate actions in a single run.
@@ -271,7 +271,7 @@ The Safe must have a threshold of 1 so the bot can execute autonomously.
 
 ### GS013 revert (Safe inner call failure)
 The Safe reverts with GS013 when the inner call fails and `safeTxGas`/`gasPrice` are both 0 (our case). Common causes:
-- **Insufficient market liquidity** — The bot tried to deallocate (withdraw) more than the idle liquidity available in a Morpho Blue market. This happens when markets have high utilization (borrows ≈ supply). The bot now reads each market's `totalSupplyAssets` and `totalBorrowAssets` from Morpho Blue before deallocating, and caps the withdrawal amount to `availableLiquidity - 5% reserve`. Markets at ≥95% utilization are skipped entirely. The bot retries on the next run as liquidity improves.
+- **Insufficient market liquidity** — The bot tried to deallocate (withdraw) more than the idle liquidity available in a Morpho Blue market. This happens when markets have high utilization (borrows ≈ supply). The bot now reads each market's `totalSupplyAssets` and `totalBorrowAssets` from Morpho Blue before deallocating, and caps the withdrawal amount to `availableLiquidity - 5% reserve` (or, for markets with an explicit max-utilization target such as WETH/USDS at 93%, to that utilization ceiling). Markets at/above the ceiling (≥95% under the reserve model, ≥93% for WETH) are skipped entirely. The bot retries on the next run as liquidity improves.
 - **Per-market cap exceeded** — The bot tried to allocate beyond 5% to a market that was already at target. Fixed by reading per-market balances instead of assuming equal distribution.
 - **Out of gas** — Gas estimation was too tight due to state changes between estimation and execution. Fixed by adding a 50% gas buffer on `estimateContractGas`.
 - **Insufficient idle balance** — Not enough USDS in the vault to allocate.

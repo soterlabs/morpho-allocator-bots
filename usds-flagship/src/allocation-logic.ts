@@ -157,6 +157,9 @@ export function computeEffectiveTargetAmounts(totalAssets: bigint, specs: Market
   });
 
   if (overflow > 0n) {
+    // NOTE: overflow is added to receivers without re-checking a receiver's own absoluteCap.
+    // Safe for the current config (only PT-sUSDS is capped; cbBTC/wstETH have no absolute cap).
+    // If a receiver ever gets an absoluteCap, this would need a second capping pass.
     const receivers = specs.map((_, i) => i).filter(i => specs[i].overflowReceiver);
     if (receivers.length > 0) {
       const share = overflow / BigInt(receivers.length);
