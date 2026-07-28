@@ -228,6 +228,45 @@ markets can only be partially drained (pool liquidity), the bot scales its alloc
 to fit the cap and grows the destination markets over successive cycles instead of
 overshooting in one shot.
 
+## Dead deposits
+
+All five markets are secured against ERC-4626 inflation attacks by a supply held on behalf of
+`0x000000000000000000000000000000000000dEaD`
+([Morpho docs](https://docs.morpho.org/curate/tutorials-market-v1/dead-deposit/)):
+
+| Market | dEaD supply shares | Note |
+| --- | --- | --- |
+| stUSDS/USDS | 1e24 | 1 USDS, seeded at deployment |
+| cbBTC/USDS | 1e24 | 1 USDS, seeded at deployment |
+| wstETH/USDS | 1e24 | 1 USDS, seeded at deployment |
+| WETH/USDS | 1e24 | 1 USDS, seeded at deployment |
+| PT-sUSDS/USDS | 1e9 | seeded 2026-07-28, [tx](https://etherscan.io/tx/0x18ded5af565264456a70fcde243f77d37bb6ccc5d8e1241723c7d04c2797d0a7) |
+
+The four original markets used the older "1 whole USDS" convention (1 USDS mints ≈1e24 shares).
+The documented threshold is a fixed **1e9 shares** — Morpho markets use a constant
+`VIRTUAL_SHARES = 1e6`, so it does not scale with the loan token's decimals — which is what
+PT-sUSDS/USDS was seeded with, for 1001 wei USDS. The extra 1e15× on the older four buys no
+additional protection.
+
+When adding a market, dead-deposit it before the vault allocates into it. Any EOA can do this —
+no allocator or curator role is needed — and it should specify `shares`, not `assets`, so Morpho
+computes the asset cost itself rather than the caller guessing at a share price that moves with
+interest:
+
+```bash
+MORPHO=0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
+cast send $LOAN_TOKEN 'approve(address,uint256)' $MORPHO <a bit over the cost>
+cast send $MORPHO 'supply((address,address,address,address,uint256),uint256,uint256,address,bytes)' \
+  '(<loanToken>,<collateral>,<oracle>,<irm>,<lltv>)' \
+  0 1000000000 0x000000000000000000000000000000000000dEaD 0x
+# verify: first return value should be >= 1e9
+cast call $MORPHO 'position(bytes32,address)(uint256,uint128,uint128)' \
+  <marketId> 0x000000000000000000000000000000000000dEaD
+```
+
+The `1 USDS dead deposit` case in `src/allocation-logic.test.ts` covers the allocation logic
+against a vault whose entire balance is a dead deposit.
+
 ## Security Notes
 
 - **Never commit `.env`** - Contains private key

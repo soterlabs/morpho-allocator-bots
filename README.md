@@ -59,13 +59,13 @@ full strategy and setup.
 
 **Markets the bot allocates into** (all with USDS as the loan token):
 
-| Market | Collateral | Oracle | LLTV | Current target |
-| --- | --- | --- | --- | --- |
-| stUSDS/USDS | [`0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9`](https://etherscan.io/address/0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9) | [`0x0A976226d113B67Bd42D672Ac9f83f92B44b454C`](https://etherscan.io/address/0x0A976226d113B67Bd42D672Ac9f83f92B44b454C) | 86% | 0% (retired) |
-| cbBTC/USDS | [`0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf`](https://etherscan.io/address/0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf) | [`0xA5AEb90F9f122989fE69Ae6224Ed923A0caF33B4`](https://etherscan.io/address/0xA5AEb90F9f122989fE69Ae6224Ed923A0caF33B4) | 86% | 6.67% |
-| wstETH/USDS | [`0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0`](https://etherscan.io/address/0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0) | [`0xc9A9440d1545047b2Ce3624DB425410cF2EAE292`](https://etherscan.io/address/0xc9A9440d1545047b2Ce3624DB425410cF2EAE292) | 86% | 6.67% |
-| PT-sUSDS/USDS | [`0xdC169AbE56461A2E0c034Da431Ac2a3ebf596094`](https://etherscan.io/address/0xdC169AbE56461A2E0c034Da431Ac2a3ebf596094) | [`0xda5901EF31ecAFa6561B2e56B4997FAdd3dB4646`](https://etherscan.io/address/0xda5901EF31ecAFa6561B2e56B4997FAdd3dB4646) | 91.5% | 6.66% (5M cap) |
-| WETH/USDS | [`0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`](https://etherscan.io/address/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) | [`0x76b2242ea5BE1FCBBF4206EA09601EA5aB22Af4d`](https://etherscan.io/address/0x76b2242ea5BE1FCBBF4206EA09601EA5aB22Af4d) | 86% | 0% (retired) |
+| Market | Collateral | Oracle | LLTV | Current target | Dead deposit |
+| --- | --- | --- | --- | --- | --- |
+| stUSDS/USDS | [`0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9`](https://etherscan.io/address/0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9) | [`0x0A976226d113B67Bd42D672Ac9f83f92B44b454C`](https://etherscan.io/address/0x0A976226d113B67Bd42D672Ac9f83f92B44b454C) | 86% | 0% (retired) | 1e24 shares (1 USDS) |
+| cbBTC/USDS | [`0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf`](https://etherscan.io/address/0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf) | [`0xA5AEb90F9f122989fE69Ae6224Ed923A0caF33B4`](https://etherscan.io/address/0xA5AEb90F9f122989fE69Ae6224Ed923A0caF33B4) | 86% | 6.67% | 1e24 shares (1 USDS) |
+| wstETH/USDS | [`0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0`](https://etherscan.io/address/0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0) | [`0xc9A9440d1545047b2Ce3624DB425410cF2EAE292`](https://etherscan.io/address/0xc9A9440d1545047b2Ce3624DB425410cF2EAE292) | 86% | 6.67% | 1e24 shares (1 USDS) |
+| PT-sUSDS/USDS | [`0xdC169AbE56461A2E0c034Da431Ac2a3ebf596094`](https://etherscan.io/address/0xdC169AbE56461A2E0c034Da431Ac2a3ebf596094) | [`0xda5901EF31ecAFa6561B2e56B4997FAdd3dB4646`](https://etherscan.io/address/0xda5901EF31ecAFa6561B2e56B4997FAdd3dB4646) | 91.5% | 6.66% (5M cap) | 1e9 shares ([tx](https://etherscan.io/tx/0x18ded5af565264456a70fcde243f77d37bb6ccc5d8e1241723c7d04c2797d0a7)) |
+| WETH/USDS | [`0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`](https://etherscan.io/address/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) | [`0x76b2242ea5BE1FCBBF4206EA09601EA5aB22Af4d`](https://etherscan.io/address/0x76b2242ea5BE1FCBBF4206EA09601EA5aB22Af4d) | 86% | 0% (retired) | 1e24 shares (1 USDS) |
 
 > **Current targets**: stUSDS and WETH retired to 0%; cbBTC / wstETH / PT-sUSDS at ~6.66%
 > each (667 / 667 / 666 = 2000). **PT-sUSDS/USDS** (91.5% LLTV, market id
@@ -73,6 +73,14 @@ full strategy and setup.
 > above the cap is split equally between cbBTC and wstETH. **WETH/USDS** is drained only up to
 > 93% market utilization. Targets are set per-service via `TARGET_<MARKET>_BPS` env vars;
 > every market that is grown or drained must also have its `ORACLE_*` set.
+
+> **Dead deposits**: every market above is secured against ERC-4626 inflation attacks by a
+> supply held on behalf of `0x000000000000000000000000000000000000dEaD`
+> ([Morpho docs](https://docs.morpho.org/curate/tutorials-market-v1/dead-deposit/)). The four
+> original markets were seeded with 1 USDS each (≈1e24 shares, the older convention);
+> PT-sUSDS/USDS was seeded with the documented minimum of exactly **1e9 shares** (1001 wei
+> USDS) on 2026-07-28. Morpho markets use a fixed `VIRTUAL_SHARES = 1e6`, so 1e9 shares is
+> the threshold regardless of the loan token's decimals.
 
 ### 2. sky.money USDT Savings Vault V2 — `usdt-savings/`
 
@@ -90,10 +98,15 @@ it. See [`usdt-savings/README.md`](usdt-savings/README.md). **USDT has 6 decimal
 | Loan token — USDT (6 dp) | [`0xdAC17F958D2ee523a2206206994597C13D831ec7`](https://etherscan.io/address/0xdAC17F958D2ee523a2206206994597C13D831ec7) |
 | Collateral — sUSDS | [`0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD`](https://etherscan.io/address/0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD) |
 
-| Market | Direction | Market ID | Oracle | LLTV |
-| --- | --- | --- | --- | --- |
-| Old sUSDS/USDT | drain from | `0x3274…cf0b` | `0x0C426d…4C79` (DAI/USD) | 96.5% |
-| New sUSDS/USDT | allocate to | `0x26b1…4d96` | `0x1C7DBd…2F9C` (USDS/USD, capped USDT) | 96.5% |
+| Market | Direction | Market ID | Oracle | LLTV | Dead deposit |
+| --- | --- | --- | --- | --- | --- |
+| Old sUSDS/USDT | drain from | `0x3274…cf0b` | `0x0C426d…4C79` (DAI/USD) | 96.5% | 1e9 shares (pre-existing) |
+| New sUSDS/USDT | allocate to | `0x26b1…4d96` | `0x1C7DBd…2F9C` (USDS/USD, capped USDT) | 96.5% | 1e9 shares ([tx](https://etherscan.io/tx/0x74f96720d79493b37ec0d7d99544c9d3aae2b6d5369cb037f7124c23b49d3569)) |
+
+> **Dead deposits**: both markets hold exactly **1e9 supply shares** on behalf of
+> `0x000000000000000000000000000000000000dEaD`. The old market was already seeded; the new
+> market was seeded on 2026-07-28 for 1001 wei USDT (0.001001 USDT) — see
+> [`usdt-savings/README.md`](usdt-savings/README.md).
 
 > The Sky.money curator msig `0x3F32bC09d41eE699844F8296e806417D6bf61Bba` is the vault's
 > owner/curator. The bot executes through the separate bot-controlled allocator msig above
