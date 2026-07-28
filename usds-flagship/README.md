@@ -44,6 +44,25 @@ The bot allocates vault funds according to this strategy:
   drained **must also have its `ORACLE_*` env var set** — a market with no oracle is
   ignored entirely (the bot warns at startup if so).
 
+## Allocation optimizer (read-only)
+
+Computes the yield-maximizing split of the vault's 20% allocated budget across the
+configured markets and prints a rebalance proposal. It executes nothing on-chain -
+no `PRIVATE_KEY` or `SAFE_ADDRESS` needed.
+
+```bash
+npm run optimize            # human-readable report
+npm run optimize -- --json  # JSON report
+```
+
+Uses the same env as the allocator (`RPC_URL`, `VAULT_ADDRESS`, `ADAPTER_ADDRESS`,
+`ORACLE_*`); markets without an oracle are excluded from optimization. The report
+shows per-market current vs suggested allocation, utilization and APY before/after,
+a "target optimum" vs "feasible now" action list, suggested `TARGET_*_BPS` values,
+and a ranking of which cap is most worth raising. PT-sUSDS suggestions are bounded
+by its 5M absolute cap; WETH drains respect its 93% max-utilization rule. Model:
+instantaneous snapshot (no rate drift, no borrower reaction) - re-run to refresh.
+
 ## Prerequisites
 
 - Node.js >= 18.0.0

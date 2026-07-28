@@ -9,6 +9,7 @@
     "start": "node dist/allocator.js",
     "dev": "tsx src/allocator.ts",
     "allocate": "tsx src/allocator.ts",
+    "optimize": "tsx src/optimize.ts",
     "test": "vitest run"
   },
   "dependencies": {
