@@ -59,9 +59,6 @@ const config = {
   dryRun: process.env.DRY_RUN === 'true',
 };
 
-
-
-
 // Fail fast on a misconfigured strategy: the per-market targets must sum to the
 // overall allocated target, otherwise the idle/allocated split silently drifts.
 // Validated over ALL markets (not just oracle-configured ones) so that a partial

@@ -65,7 +65,7 @@ instantaneous snapshot (no rate drift, no borrower reaction) - re-run to refresh
 
 ## Prerequisites
 
-- Node.js >= 18.0.0
+- Node.js >= 20.19.0
 - A Safe multisig (1/3 threshold) where the bot is one of the owners
 - The **Safe address** must be set as an **Allocator** on the vault
 - Deployed vault and adapter addresses from the deployment script
