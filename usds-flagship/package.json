@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@morpho-org/blue-sdk": "^6.4.0",
     "dotenv": "^16.4.5",
     "viem": "^2.21.0"
   },
