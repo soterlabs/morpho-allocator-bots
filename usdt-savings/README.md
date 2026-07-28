@@ -26,10 +26,25 @@ The fund-affecting decision (`computeMigration`) is a pure function in `src/migr
 
 ## Markets
 
-| | Market ID | Oracle |
-| --- | --- | --- |
-| **Old** (drain) | `0x3274643db77a064abd3bc851de77556a4ad2e2f502f4f0c80845fa8f909ecf0b` | `0x0C426d174FC88B7A25d59945Ab2F7274Bf7B4C79` (DAI/USD) |
-| **New** (fill) | `0x26b178d49895f80ca3c39b2745efc4cd9adcddfcc73dae93e531e86977ec4d96` | `0x1C7DBd66dF93594bA08af8e72c75Ba2004d92F9C` (USDS/USD, capped USDT) |
+| | Market ID | Oracle | Dead deposit |
+| --- | --- | --- | --- |
+| **Old** (drain) | `0x3274643db77a064abd3bc851de77556a4ad2e2f502f4f0c80845fa8f909ecf0b` | `0x0C426d174FC88B7A25d59945Ab2F7274Bf7B4C79` (DAI/USD) | 1e9 shares (pre-existing) |
+| **New** (fill) | `0x26b178d49895f80ca3c39b2745efc4cd9adcddfcc73dae93e531e86977ec4d96` | `0x1C7DBd66dF93594bA08af8e72c75Ba2004d92F9C` (USDS/USD, capped USDT) | 1e9 shares ([tx](https://etherscan.io/tx/0x74f96720d79493b37ec0d7d99544c9d3aae2b6d5369cb037f7124c23b49d3569)) |
+
+### Dead deposits
+
+Both markets are secured against ERC-4626 inflation attacks by a supply held on behalf of
+`0x000000000000000000000000000000000000dEaD`
+([Morpho docs](https://docs.morpho.org/curate/tutorials-market-v1/dead-deposit/)). This matters
+here specifically because a migration empties a market: the vault's adapter is the **sole
+supplier** of both markets, so without the dead deposit the old market's share supply would
+return to 0 once drained, which is exactly the state the attack needs.
+
+The new market was seeded on 2026-07-28 — `supply(marketParams, assets: 0, shares: 1e9,
+onBehalf: 0x…dEaD)`, which cost **1001 wei USDT (0.001001 USDT)**. Always specify `shares`
+(not `assets`): the threshold is a fixed 1e9 *shares* because Morpho markets use a constant
+`VIRTUAL_SHARES = 1e6` regardless of the loan token's decimals, and letting Morpho compute the
+asset cost avoids guessing at a share price that moves with interest.
 
 Common params: loan token USDT `0xdAC17F958D2ee523a2206206994597C13D831ec7`, collateral sUSDS `0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD`, IRM `0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC`, LLTV 96.5%. The bot re-derives both market ids from these params at startup and **fails fast** if they don't match the ids above (guards against a wrong oracle/LLTV silently addressing the wrong market).
 
