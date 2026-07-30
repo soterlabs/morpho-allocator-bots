@@ -12,6 +12,12 @@
  * the bot withdraws nothing and waits for borrowers to repay (rising rates incentivize this).
  * The migration completes on its own once the old market is drained.
  *
+ * The same run also keeps the vault's *default liquidity route* — `liquidityAdapter` +
+ * `liquidityData`, which is where a plain deposit into the vault sends its assets — pointed at
+ * the NEW market. Otherwise fresh deposits keep landing in the market being drained. Setting it
+ * is allocator-gated (same role the bot already holds) and idempotent, so it is re-checked every
+ * run and included in the batch only when it actually differs.
+ *
  * Transactions execute through a Safe multisig (threshold 1) that must be an allocator on the
  * vault; the bot is one of the Safe's owners.
  *
@@ -27,7 +33,7 @@ import { createPublicClient, createWalletClient, http, formatUnits, parseUnits, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import 'dotenv/config';
-import { computeMigration, type MigrationInput } from './migration-logic.js';
+import { computeMigration, planLiquidityRoute, type MigrationInput } from './migration-logic.js';
 
 // ============ CONFIGURATION ============
 
@@ -44,6 +50,11 @@ const config = {
 
   // Dust floor (USDT) below which a migration round is skipped. USDT has 6 decimals.
   minMigrateAmount: parseUnits(process.env.MIN_MIGRATE_USDT || '100', 6),
+
+  // Keep the vault's default liquidity route (liquidityAdapter + liquidityData) pointed at the
+  // NEW market, so plain deposits land there instead of the market being drained. Set to
+  // "false" to disable (e.g. if the curator wants to own that setting).
+  manageLiquidityAdapter: process.env.MANAGE_LIQUIDITY_ADAPTER !== 'false',
 
   dryRun: process.env.DRY_RUN === 'true',
 };
@@ -105,15 +116,16 @@ function encodeMarketParams(p: MarketParams): Hex {
   return encodeAbiParameters(MARKET_PARAMS_FIELDS, [p.loanToken, p.collateralToken, p.oracle, p.irm, p.lltv]);
 }
 
-// Morpho Blue market id = keccak256(abi.encode(MarketParams)).
-function computeMarketId(p: MarketParams): Hex {
-  return keccak256(encodeMarketParams(p));
-}
+// abi.encode(MarketParams) for each market — the `data` argument for the vault's
+// allocate/deallocate and the value of its `liquidityData`. The Morpho Blue market id is its
+// keccak256.
+const OLD_MARKET_DATA = encodeMarketParams(oldMarket);
+const NEW_MARKET_DATA = encodeMarketParams(newMarket);
+const OLD_MARKET_ID = keccak256(OLD_MARKET_DATA);
+const NEW_MARKET_ID = keccak256(NEW_MARKET_DATA);
 
 // Fail fast if the configured params don't reproduce the known market ids (wrong oracle/LLTV
 // would silently address the wrong market and move funds incorrectly).
-const OLD_MARKET_ID = computeMarketId(oldMarket);
-const NEW_MARKET_ID = computeMarketId(newMarket);
 if (OLD_MARKET_ID.toLowerCase() !== OLD_MARKET_ID_KNOWN.toLowerCase()) {
   throw new Error(`Old market id mismatch: derived ${OLD_MARKET_ID}, expected ${OLD_MARKET_ID_KNOWN}. Check OLD_ORACLE / LLTV / token addresses.`);
 }
@@ -126,6 +138,7 @@ if (NEW_MARKET_ID.toLowerCase() !== NEW_MARKET_ID_KNOWN.toLowerCase()) {
 const vaultAbi = [
   { name: 'totalAssets', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { name: 'isAllocator', type: 'function', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'bool' }] },
+  { name: 'isAdapter', type: 'function', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'bool' }] },
   {
     name: 'allocate', type: 'function', stateMutability: 'nonpayable',
     inputs: [{ name: 'adapter', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'assets', type: 'uint256' }],
@@ -134,6 +147,16 @@ const vaultAbi = [
   {
     name: 'deallocate', type: 'function', stateMutability: 'nonpayable',
     inputs: [{ name: 'adapter', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'assets', type: 'uint256' }],
+    outputs: [],
+  },
+  // Default liquidity route: where a plain deposit into the vault sends its assets (and where a
+  // withdrawal pulls from first). `liquidityData` is abi.encode(MarketParams) for a Morpho
+  // market adapter, so it is what selects the market. Setting it is allocator-gated.
+  { name: 'liquidityAdapter', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { name: 'liquidityData', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'bytes' }] },
+  {
+    name: 'setLiquidityAdapterAndData', type: 'function', stateMutability: 'nonpayable',
+    inputs: [{ name: 'newLiquidityAdapter', type: 'address' }, { name: 'newLiquidityData', type: 'bytes' }],
     outputs: [],
   },
 ] as const;
@@ -198,6 +221,19 @@ function log(message: string, data?: unknown) {
 }
 
 const usdt = (x: bigint) => `${formatUnits(x, USDT_DECIMALS)} USDT`;
+
+/**
+ * Human-readable label for the vault's `liquidityData` — the market a plain deposit routes into.
+ * For a Morpho market adapter the data is abi.encode(MarketParams), so its keccak256 is the
+ * market id; anything that doesn't hash to a market we know is reported verbatim.
+ */
+function describeRouteMarket(data: string): string {
+  if (!data || !data.startsWith('0x') || data.length <= 2) return 'none (no route data set)';
+  const id = keccak256(data as Hex);
+  if (id.toLowerCase() === NEW_MARKET_ID.toLowerCase()) return `NEW market (${id})`;
+  if (id.toLowerCase() === OLD_MARKET_ID.toLowerCase()) return `OLD market (${id})`;
+  return `unrecognized market (${id})`;
+}
 
 /**
  * Pack multiple calls into a Safe MultiSend payload.
@@ -285,15 +321,30 @@ async function main() {
   if (threshold !== 1n) throw new Error(`Safe threshold is ${threshold}, expected 1. Bot cannot execute autonomously.`);
   const isAllocator = await publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'isAllocator', args: [config.safeAddress] });
   if (!isAllocator) throw new Error(`Safe ${config.safeAddress} is not an allocator for this vault`);
-  log('Safe ownership, threshold (1), and allocator permission verified');
 
-  // Read current state: positions in each market, old-market pool liquidity, vault totals.
-  const [oldPosition, newPosition, oldMarketState, adapterAssets, vaultIdle] = await Promise.all([
+  // ADAPTER_ADDRESS must be a *registered* adapter on this vault. The vault does NOT validate the
+  // address passed to setLiquidityAdapterAndData — it accepts any address, including an EOA or the
+  // zero address (verified on-chain). So a mistyped ADAPTER_ADDRESS would be written into the
+  // vault's deposit/withdraw route and break every subsequent deposit, and the pre-flight
+  // simulation could not catch it (the call succeeds). Allocate/deallocate would revert on a bad
+  // adapter, but a round that only repoints the route has no allocate to fail on. Fail fast here.
+  const isRegisteredAdapter = await publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'isAdapter', args: [config.adapterAddress] });
+  if (!isRegisteredAdapter) {
+    throw new Error(`ADAPTER_ADDRESS ${config.adapterAddress} is not a registered adapter on vault ${config.vaultAddress}. ` +
+      `Refusing to run: the vault would accept it as the default liquidity route and break deposits.`);
+  }
+  log('Safe ownership, threshold (1), allocator permission, and adapter registration verified');
+
+  // Read current state: positions in each market, old-market pool liquidity, vault totals, and
+  // the vault's default liquidity route.
+  const [oldPosition, newPosition, oldMarketState, adapterAssets, vaultIdle, liquidityAdapter, liquidityData] = await Promise.all([
     publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [OLD_MARKET_ID] }),
     publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [NEW_MARKET_ID] }),
     publicClient.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: 'market', args: [OLD_MARKET_ID] }),
     publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'realAssets' }),
     publicClient.readContract({ address: USDT, abi: erc20Abi, functionName: 'balanceOf', args: [config.vaultAddress] }),
+    publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'liquidityAdapter' }),
+    publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'liquidityData' }),
   ]);
 
   const [oldSupply, , oldBorrow] = oldMarketState;
@@ -306,6 +357,8 @@ async function main() {
     adapterRealAssets: usdt(adapterAssets),
     vaultIdle: usdt(vaultIdle),
     maxUtilization: `${config.maxUtilizationBps / 100}%`,
+    liquidityAdapter,
+    liquidityRouteMarket: describeRouteMarket(liquidityData),
   });
 
   // Decide this round's migration amount (min of old position and the 93%-utilization cap).
@@ -318,40 +371,83 @@ async function main() {
   };
   const plan = computeMigration(migrationInput);
 
-  if (plan.status === 'done') {
-    log(`Migration complete — old market holds ${usdt(plan.oldPosition)} (below the ${usdt(config.minMigrateAmount)} dust floor). Nothing to do.`);
-    return;
-  }
-  if (plan.status === 'wait-utilization') {
-    log(`Old market is at/above ${config.maxUtilizationBps / 100}% utilization (${oldUtilizationPct}%) — withdrawing nothing this round and waiting for borrowers to repay.`);
-    return;
-  }
-  if (plan.status === 'dust') {
-    log(`Only ${usdt(plan.amount)} withdrawable this round (below the ${usdt(config.minMigrateAmount)} dust floor) — skipping.`);
-    return;
-  }
+  // Actions for this round. The liquidity-route fix and the migration are independent: the route
+  // is repointed even on rounds where there is nothing to migrate (waiting on utilization, dust,
+  // or already drained), and they share one atomic Safe transaction when both apply.
+  const vaultCalls: { name: string; calldata: Hex }[] = [];
 
-  // plan.status === 'migrate'
-  const amount = plan.amount;
-  if (plan.utilizationCapped) {
-    log(`Withdrawal capped by ${config.maxUtilizationBps / 100}% utilization: moving ${usdt(amount)} this round (old position ${usdt(oldPosition)}, withdrawable ${usdt(plan.withdrawableByUtilization)}).`);
+  // 1. Default liquidity route — where a plain deposit into the vault goes. While this still
+  // encodes the OLD market, every new deposit lands straight back in the market we are draining.
+  const routePlan = planLiquidityRoute({
+    currentAdapter: liquidityAdapter,
+    currentData: liquidityData,
+    desiredAdapter: config.adapterAddress,
+    desiredData: NEW_MARKET_DATA,
+    migrateFromData: OLD_MARKET_DATA,
+    enabled: config.manageLiquidityAdapter,
+  });
+
+  if (routePlan.status === 'ok') {
+    log('Default liquidity route already points at the new market — leaving it as is.');
+  } else if (routePlan.status === 'disabled') {
+    log(`Default liquidity route points at ${describeRouteMarket(liquidityData)} but MANAGE_LIQUIDITY_ADAPTER=false — not touching it.`);
+  } else if (routePlan.status === 'foreign-adapter') {
+    log(`WARNING: the vault's liquidity adapter is ${routePlan.currentAdapter}, not this bot's adapter ` +
+        `${config.adapterAddress}. That is a curator-level choice, so the bot is not overwriting it — ` +
+        `new deposits will keep following that adapter. Re-point it manually (or fix ADAPTER_ADDRESS) ` +
+        `if this is unexpected.`);
+  } else if (routePlan.status === 'foreign-market') {
+    log(`WARNING: the default liquidity route points at ${describeRouteMarket(routePlan.currentData)} — ` +
+        `neither the old market this bot migrates away from nor the new one. Someone repointed it ` +
+        `deliberately, so the bot is leaving it alone rather than overwriting it every run.`);
+  } else if (routePlan.status === 'update') {
+    log(`Default liquidity route currently sends new deposits to ${describeRouteMarket(liquidityData)} — repointing it at the new market.`);
+    vaultCalls.push({
+      name: `setLiquidityAdapterAndData -> new market (${NEW_MARKET_ID})`,
+      calldata: encodeFunctionData({
+        abi: vaultAbi, functionName: 'setLiquidityAdapterAndData',
+        args: [config.adapterAddress, NEW_MARKET_DATA],
+      }),
+    });
   } else {
-    log(`Moving ${usdt(amount)} from the old market to the new market (draining the remaining old position).`);
+    // Exhaustiveness guard: a future status must not fall through into "send the transaction".
+    const unreachable: never = routePlan;
+    throw new Error(`Unhandled liquidity route plan: ${JSON.stringify(unreachable)}`);
   }
 
-  // Atomic batch: deallocate from old, then allocate the freed idle to new.
-  const vaultCalls: { name: string; calldata: Hex }[] = [
-    {
-      name: `deallocate ${usdt(amount)} from old market`,
-      calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'deallocate', args: [config.adapterAddress, encodeMarketParams(oldMarket), amount] }),
-    },
-    {
-      name: `allocate ${usdt(amount)} to new market`,
-      calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'allocate', args: [config.adapterAddress, encodeMarketParams(newMarket), amount] }),
-    },
-  ];
+  // 2. This round's migration slice, if any.
+  if (plan.status === 'done') {
+    log(`Migration complete — old market holds ${usdt(plan.oldPosition)} (below the ${usdt(config.minMigrateAmount)} dust floor). Nothing to migrate.`);
+  } else if (plan.status === 'wait-utilization') {
+    log(`Old market is at/above ${config.maxUtilizationBps / 100}% utilization (${oldUtilizationPct}%) — withdrawing nothing this round and waiting for borrowers to repay.`);
+  } else if (plan.status === 'dust') {
+    log(`Only ${usdt(plan.amount)} withdrawable this round (below the ${usdt(config.minMigrateAmount)} dust floor) — skipping.`);
+  } else {
+    const amount = plan.amount;
+    if (plan.utilizationCapped) {
+      log(`Withdrawal capped by ${config.maxUtilizationBps / 100}% utilization: moving ${usdt(amount)} this round (old position ${usdt(oldPosition)}, withdrawable ${usdt(plan.withdrawableByUtilization)}).`);
+    } else {
+      log(`Moving ${usdt(amount)} from the old market to the new market (draining the remaining old position).`);
+    }
+    // Deallocate from old, then allocate the freed idle to new.
+    vaultCalls.push(
+      {
+        name: `deallocate ${usdt(amount)} from old market`,
+        calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'deallocate', args: [config.adapterAddress, OLD_MARKET_DATA, amount] }),
+      },
+      {
+        name: `allocate ${usdt(amount)} to new market`,
+        calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'allocate', args: [config.adapterAddress, NEW_MARKET_DATA, amount] }),
+      },
+    );
+  }
 
-  log(`Batching ${vaultCalls.length} actions into single transaction:`);
+  if (vaultCalls.length === 0) {
+    log('Nothing to do this round.');
+    return;
+  }
+
+  log(`Batching ${vaultCalls.length} action(s) into single transaction:`);
   for (const c of vaultCalls) log(`  ${c.name}`);
 
   if (config.dryRun) {
@@ -377,9 +473,9 @@ async function main() {
       const r = sim.results[failed];
       const err = r.error as { shortMessage?: string; message?: string } | undefined;
       const reason = (err && (err.shortMessage || err.message)) || 'reverted';
-      log(`WARNING: migration batch would revert at "${vaultCalls[failed].name}": ${reason}. ` +
-          `The migration may be BLOCKED (market not enabled, caps not raised, or insufficient ` +
-          `liquidity) — not submitting.`);
+      log(`WARNING: batch would revert at "${vaultCalls[failed].name}": ${reason}. ` +
+          `The migration may be BLOCKED (market not enabled, caps not raised, insufficient ` +
+          `liquidity, or the Safe lost the allocator role) — not submitting.`);
       process.exit(1);
     }
     log('Pre-flight simulation passed — submitting.');
@@ -420,11 +516,16 @@ async function main() {
   }
 
   // Final state.
-  const [finalOld, finalNew] = await Promise.all([
+  const [finalOld, finalNew, finalLiquidityData] = await Promise.all([
     publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [OLD_MARKET_ID] }),
     publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [NEW_MARKET_ID] }),
+    publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'liquidityData' }),
   ]);
-  log('Final state:', { oldMarketPosition: usdt(finalOld), newMarketPosition: usdt(finalNew) });
+  log('Final state:', {
+    oldMarketPosition: usdt(finalOld),
+    newMarketPosition: usdt(finalNew),
+    liquidityRouteMarket: describeRouteMarket(finalLiquidityData),
+  });
   log('=== Migration round complete ===');
 }
 

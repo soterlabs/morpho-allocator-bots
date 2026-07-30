@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeMigration, maxWithdrawableForUtilization, type MigrationInput } from './migration-logic.js';
+import { computeMigration, maxWithdrawableForUtilization, planLiquidityRoute, type LiquidityRouteInput, type MigrationInput } from './migration-logic.js';
 import { parseUnits } from 'viem';
 
 // USDT has 6 decimals.
@@ -135,5 +135,80 @@ describe('computeMigration', () => {
   it('treats a zero old position as done', () => {
     const plan = computeMigration(input({ oldPosition: 0n, oldTotalSupplyAssets: 0n, oldTotalBorrowAssets: 0n }));
     expect(plan.status).toBe('done');
+  });
+});
+
+describe('planLiquidityRoute', () => {
+  const ADAPTER = '0x6C5D5D47A39FE9f8CA14731a9A42bD31d64fb40D';
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  // Stand-ins for abi.encode(MarketParams) of each market — only equality matters here.
+  const OLD_DATA = '0xaaaa';
+  const NEW_DATA = '0xbbbb';
+
+  function route(overrides: Partial<LiquidityRouteInput> = {}): LiquidityRouteInput {
+    return {
+      currentAdapter: ADAPTER,
+      currentData: OLD_DATA,
+      desiredAdapter: ADAPTER,
+      desiredData: NEW_DATA,
+      migrateFromData: OLD_DATA,
+      enabled: true,
+      ...overrides,
+    };
+  }
+
+  it('updates when the route still points at the old market', () => {
+    expect(planLiquidityRoute(route())).toEqual({ status: 'update' });
+  });
+
+  it('is a no-op once the route points at the new market (idempotent across runs)', () => {
+    expect(planLiquidityRoute(route({ currentData: NEW_DATA }))).toEqual({ status: 'ok' });
+  });
+
+  it('ignores address and hex casing when comparing', () => {
+    const plan = planLiquidityRoute(route({
+      currentAdapter: ADAPTER.toLowerCase(),
+      currentData: NEW_DATA.toUpperCase().replace('0X', '0x'),
+    }));
+    expect(plan).toEqual({ status: 'ok' });
+  });
+
+  it('adopts the route when the vault has none set (zero adapter)', () => {
+    expect(planLiquidityRoute(route({ currentAdapter: ZERO, currentData: '0x' }))).toEqual({ status: 'update' });
+  });
+
+  it('refuses to overwrite a different (curator-chosen) adapter contract', () => {
+    const foreign = '0x1111111111111111111111111111111111111111';
+    expect(planLiquidityRoute(route({ currentAdapter: foreign }))).toEqual({
+      status: 'foreign-adapter',
+      currentAdapter: foreign,
+    });
+  });
+
+  it('refuses to overwrite a route aimed at a third market via our adapter', () => {
+    // The bot's mandate is "get off the OLD market", not "own the route". Without this guard the
+    // bot would fight a curator who repointed the route, overwriting it every run forever.
+    const thirdMarket = '0xcccc';
+    expect(planLiquidityRoute(route({ currentData: thirdMarket }))).toEqual({
+      status: 'foreign-market',
+      currentData: thirdMarket,
+    });
+  });
+
+  it('adopts a route with our adapter but no data set', () => {
+    expect(planLiquidityRoute(route({ currentData: '0x' }))).toEqual({ status: 'update' });
+  });
+
+  it('still takes over the old-market route after a curator flips it back', () => {
+    // Idempotence must not become inaction: old market -> update, every time.
+    expect(planLiquidityRoute(route({ currentData: OLD_DATA }))).toEqual({ status: 'update' });
+  });
+
+  it('reports disabled when the kill switch is off and a change would be needed', () => {
+    expect(planLiquidityRoute(route({ enabled: false }))).toEqual({ status: 'disabled' });
+  });
+
+  it('still reports ok when the kill switch is off but the route is already correct', () => {
+    expect(planLiquidityRoute(route({ enabled: false, currentData: NEW_DATA }))).toEqual({ status: 'ok' });
   });
 });

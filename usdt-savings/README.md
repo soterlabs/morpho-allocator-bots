@@ -9,7 +9,8 @@ Transactions execute through a **Safe multisig** (threshold 1) that must be an a
 ## Strategy
 
 Each run the bot:
-1. Reads the vault's position in the **old** market and the old market's pool state (supply/borrow).
+1. Reads the vault's position in the **old** market, the old market's pool state (supply/borrow),
+   and the vault's **default liquidity route**.
 2. Computes how much to move this round: `min(old position, withdrawable-at-93%-utilization)`.
    - Deallocating from a Morpho market removes supply while borrows stay put, raising
      utilization. The bot caps the withdrawal so post-withdraw utilization stays **≤ 93%**
@@ -17,12 +18,67 @@ Each run the bot:
    - If the old market is **already at/above 93%** utilization, it withdraws **nothing and
      waits** — rising rates on the old market incentivize borrowers to repay, freeing
      liquidity over the following cycles.
-3. In a single atomic Safe transaction: `deallocate(amount)` from the old market, then
-   `allocate(amount)` to the new market.
+3. In a single atomic Safe transaction: repoint the liquidity route (only when it isn't already
+   on the new market), `deallocate(amount)` from the old market, then `allocate(amount)` to the
+   new market.
 4. Once the old market position falls below the `MIN_MIGRATE_USDT` dust floor, the migration
    is **complete** and each run is a no-op.
 
-The fund-affecting decision (`computeMigration`) is a pure function in `src/migration-logic.ts`, unit-tested in `src/migration-logic.test.ts` (utilization cap, wait/dust/done boundaries).
+The fund-affecting decisions (`computeMigration`, `planLiquidityRoute`) are pure functions in
+`src/migration-logic.ts`, unit-tested in `src/migration-logic.test.ts` (utilization cap,
+wait/dust/done boundaries, route idempotence and the foreign-adapter guard).
+
+## Default liquidity route
+
+The vault stores a **liquidity adapter + liquidity data** pair (`liquidityAdapter()` /
+`liquidityData()`). That pair is the vault's *default route*: a plain `deposit` forwards the
+assets straight to that adapter with that data, and for a `MorphoMarketV1AdapterV2` the data is
+`abi.encode(MarketParams)` — so it is what picks the market. While it still encodes the **old**
+market, every new deposit into the vault lands back in the market the bot is draining (which is
+what the Morpho UI shows as the market liquidity flows to).
+
+So each run the bot also ensures the route is `ADAPTER_ADDRESS` + the **new** market's params,
+via `setLiquidityAdapterAndData` — an **allocator-gated** call, the same role the bot's Safe
+already holds (verified on-chain: the call succeeds from the allocator Safe and reverts from an
+unprivileged address). The check is:
+
+- **idempotent** — once the route matches, later runs emit no call at all, so this costs one
+  transaction, not one per cycle;
+- **independent of the migration** — it is applied even on rounds that migrate nothing (waiting
+  on utilization, dust, or already drained), and shares the same atomic batch when both apply;
+- **narrow** — the bot's mandate is *get the route off the old market*, not *own the route*. It
+  only takes over a route that is unset or still points at the old market. A route aimed at
+  another adapter contract, or at a third market, is someone else's decision: the bot logs a
+  warning and leaves it alone rather than overwriting it on every run forever.
+  `MANAGE_LIQUIDITY_ADAPTER=false` opts out entirely.
+
+Because the vault does **not** validate the address passed to `setLiquidityAdapterAndData` — it
+accepts any address, including an EOA or the zero address — the bot asserts at startup that
+`ADAPTER_ADDRESS` is a registered adapter on the vault (`isAdapter`) and refuses to run otherwise.
+Without that, a mistyped `ADAPTER_ADDRESS` could be written into the vault's route and break every
+subsequent deposit, and the pre-flight simulation would not catch it (the call succeeds).
+
+### Trade-off: the route is also the exit
+
+The route is the first place *withdrawals* pull from too, and Vault V2 has one route pair for both
+directions — you cannot send deposits to one market and redemptions to another. So while the
+migration runs, redemption capacity is bounded by whichever market the route points at. Measured
+on 2026-07-30, with the vault holding no idle:
+
+| | available liquidity | utilization | max single redemption |
+| --- | --- | --- | --- |
+| Old market | 5.25M USDT | 90.03% | ~5,248,501 USDT |
+| New market | 0.33M USDT | 98.65% | ~332,314 USDT |
+
+The new market is thin because the vault is effectively its sole supplier and borrowers have been
+absorbing each round's supply (utilization has sat near 99%), whereas the old market carries
+~14.8M of third-party supply. Redemptions above the route market's liquidity are not stuck —
+users can `forceDeallocate` from the other market for a **0.2%** penalty — but they are degraded.
+
+This is the accepted cost of not growing the deprecated market: pointing the route at the new
+market stops fresh deposits landing in the market being retired, and lowers the new market's
+utilization (and so its borrow rate), which is what pulls borrowers across and frees the old
+market's liquidity for the bot to withdraw. The condition resolves as the migration completes.
 
 ## Markets
 
@@ -51,8 +107,8 @@ Common params: loan token USDT `0xdAC17F958D2ee523a2206206994597C13D831ec7`, col
 ## Prerequisites
 
 - Node.js >= 18.0.0
-- The new market's caps must be live on the vault and the liquidity adapter switched to it
-  (migration steps 1–3 in the deployment repo) before reallocation makes sense.
+- The new market's caps must be live on the vault before reallocation makes sense (the bot
+  switches the liquidity adapter to the new market itself — see above).
 - A **Safe** (threshold 1) set as an **allocator** on the vault, with the bot's signer as an owner.
 
 ## Setup
