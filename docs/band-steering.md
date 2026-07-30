@@ -43,7 +43,7 @@ thresholds are logged in every decision trace.
 
 | parameter | value |
 |---|---|
-| SSR_t margin | SSR + 15 bps (`SSR_T_MARGIN_BPS`, one global margin — no per-market overrides in v1, see Limitations) |
+| SSR_t margin | SSR + 15 bps (`SSR_T_MARGIN_BPS`; per-market override via `SSR_T_MARGIN_<MARKET>_BPS`) |
 | LOW / HIGH thresholds | 4/7 × SSR / 8/7 × SSR |
 | bands (util the bot holds) | harvest 9000 · high 9200 · mid 9300 · drain 9400 bps |
 | util deadband | 50 bps |
@@ -123,7 +123,8 @@ decisions get `R-FLOOR` appended to their reasons.
 | `BOT_PAUSED` | `false` | `true` → log `paused`, exit 0 |
 | `MAX_ALLOCATE_USDS` | **REQUIRED** (> 0) | per-market per-cycle grow step cap, whole USDS |
 | `MAX_DEALLOCATE_USDS` | **REQUIRED** (> 0) | per-market per-cycle drain step cap (in `bps` mode stays optional, `0` = no cap) |
-| `SSR_T_MARGIN_BPS` | `15` | one global margin applied to every STEERED market — per-market override envs are NOT implemented in v1 (a `SSR_T_MARGIN_BPS_<MARKET>` var would be silently ignored; see Limitations) |
+| `SSR_T_MARGIN_BPS` | `15` | global SSR_t margin for STEERED markets |
+| `SSR_T_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
 | `BAND_UTIL_HARVEST_BPS` | `9000` | monotonicity validated: drain ≥ mid ≥ high ≥ harvest |
 | `BAND_UTIL_HIGH_BPS` | `9200` | |
 | `BAND_UTIL_MID_BPS` | `9300` | |
@@ -230,10 +231,9 @@ vetoes nothing in v1.
   given. Projections are indicative, not bit-exact forecasts.
 - **SOUNDING never drains** on its own — exposure in a sounding market is
   bounded only by its effective cap and the wind-down/RETIRED overlays.
-- **Single global SSR_t margin**: the decided-parameters note "per-market
-  override envs exist" is NOT implemented in v1 — a recorded deviation. The
-  pinned `BandConfig`/`MarketObservation` interfaces carry exactly one
-  global `SSR_T_MARGIN_BPS`, and `decideSteered` applies it to every
-  STEERED market. Setting e.g. `SSR_T_MARGIN_BPS_CBBTC` has no effect.
-  Per-market margins need a coordinated interface change (per-market field
-  threaded through `MarketObservation`) in a later phase.
+- **SSR_t margin is per-market-overridable**: `SSR_T_MARGIN_<MARKET>_BPS`
+  (e.g. `SSR_T_MARGIN_PTSUSDS_BPS=25`) overrides the global
+  `SSR_T_MARGIN_BPS` for that market; unset markets use the global value.
+  The harvest-rule decision trace marks resolved overrides with
+  "per-market override". Product default remains a single global margin
+  until shadow data says otherwise.

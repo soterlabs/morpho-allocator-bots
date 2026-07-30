@@ -40,6 +40,10 @@ const SEC_PER_HOUR = 3_600;
 export interface MarketObservation {
   index: number; name: string; mode: MarketMode;
   maturityUtcSec?: number;
+  // Per-market SSR_t margin override (bps). Falls back to cfg.ssrTMarginBps when unset.
+  // Lets PT-sUSDS carry a different harvest hurdle than the bluechips (product open
+  // question resolved as "single margin for now, differentiate via config when needed").
+  ssrTMarginBps?: number;
   totalSupplyAssets: bigint; totalBorrowAssets: bigint;  // accrued market totals
   vaultAssets: bigint;                                    // adapter position in this market
   supplyApy: number;                                      // instantaneous, 0.0247 = 2.47%
@@ -204,7 +208,8 @@ function decideSounding(m: MarketObservation, cfg: BandConfig, nowSec: number): 
  *   maxDeallocateUsds (rule unchanged — the clamp is recorded in reasons).
  */
 function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, nowSec: number): BandDecision {
-  const ssrT = ssrApy + cfg.ssrTMarginBps / 10000;
+  const marginBps = m.ssrTMarginBps ?? cfg.ssrTMarginBps;
+  const ssrT = ssrApy + marginBps / 10000;
   const satApy = 0.9 * m.anchorApy;
   const lowThr = ssrApy * Number(cfg.lowFracNum) / Number(cfg.lowFracDen);
   const highThr = ssrApy * Number(cfg.highFracNum) / Number(cfg.highFracDen);
@@ -217,7 +222,8 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
     rule = 'R-HARV';
     reasons.push(
       `satApy ${fmtPct(satApy)} (0.9 x anchor ${fmtPct(m.anchorApy)}) >= SSR_t ${fmtPct(ssrT)} ` +
-      `(SSR ${fmtPct(ssrApy)} + ${cfg.ssrTMarginBps} bps) -> harvest band ${bandUtilBps} bps`
+      `(SSR ${fmtPct(ssrApy)} + ${marginBps} bps${m.ssrTMarginBps !== undefined ? ', per-market override' : ''}) ` +
+      `-> harvest band ${bandUtilBps} bps`
     );
   } else if (m.supplyApy < lowThr) {
     bandUtilBps = cfg.bandUtilDrainBps;

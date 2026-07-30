@@ -745,6 +745,7 @@ async function main() {
         name: m.name,
         mode: m.mode,
         maturityUtcSec: m.maturityUtcSec,
+        ssrTMarginBps: m.ssrTMarginBps,
         totalSupplyAssets: accrued.totalSupplyAssets,
         totalBorrowAssets: accrued.totalBorrowAssets,
         vaultAssets: pinnedPerMarketAssets[i],

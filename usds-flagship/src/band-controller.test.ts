@@ -148,6 +148,39 @@ describe('band classification (STEERED)', () => {
   });
 });
 
+describe('per-market SSR_t margin override', () => {
+  // anchor 4.15% -> satApy 3.735%: above the global SSR_t 3.67% but below SSR + 50 bps
+  // (4.02%). util 8500 so the harvest case is a clean drain toward 9000.
+  const nearHurdle = () => cbBtc({
+    totalSupplyAssets: eth('1000000'), totalBorrowAssets: eth('850000'),
+    vaultAssets: eth('900000'), anchorApy: 0.0415, supplyApy: 0.035,
+  });
+
+  it('falls back to the global margin when unset (harvest at satApy 3.735% >= 3.67%)', () => {
+    const d = decide(nearHurdle());
+    expect(d.rule).toBe('R-HARV');
+    expect(d.reasons.join(' | ')).not.toContain('per-market override');
+  });
+
+  it('a higher per-market margin raises the hurdle (50 bps -> the same market is mid band)', () => {
+    const d = decide({ ...nearHurdle(), ssrTMarginBps: 50 });
+    expect(d.rule).toBe('R-MID93');
+    expect(d.bandUtilBps).toBe(9300);
+  });
+
+  it('a lower per-market margin lowers the hurdle (anchor 4.0%, satApy 3.60% harvests at +5 bps)', () => {
+    // Global margin 15 bps: satApy 3.60% < 3.67% -> not harvest. Override 5 bps: 3.60% >= 3.57%.
+    const base = cbBtc({
+      totalSupplyAssets: eth('1000000'), totalBorrowAssets: eth('850000'),
+      vaultAssets: eth('900000'), anchorApy: 0.04, supplyApy: 0.035,
+    });
+    expect(decide(base).rule).toBe('R-MID93');
+    const d = decide({ ...base, ssrTMarginBps: 5 });
+    expect(d.rule).toBe('R-HARV');
+    expect(d.reasons.join(' | ')).toContain('per-market override');
+  });
+});
+
 describe('ceil inversion exactness', () => {
   // The inverted supply target S* = ceil(borrow * 10000 / band) is exact: at S* the
   // (floored) utilization is <= band, and at S* - 1 wei the true utilization strictly

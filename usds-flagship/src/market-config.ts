@@ -58,6 +58,11 @@ export interface MarketConfig {
   //   RETIRED  — drain to zero
   // From MODE_* env vars, validated against the enum (parseMarketMode throws on anything else).
   mode: MarketMode;
+  // Optional per-market SSR_t margin override (bps) for bands mode, from SSR_T_MARGIN_<MARKET>_BPS
+  // env vars. Unset = the market uses the global SSR_T_MARGIN_BPS. Lets PT-sUSDS and the
+  // bluechips carry different harvest hurdles (Kacper: "docelowy rate powinien byc rozny
+  // dla PT-sUSDS i bluechipow").
+  ssrTMarginBps?: number;
   // Optional PT maturity (unix seconds, UTC). Bands mode blocks grows from T-30d and drains
   // the market like RETIRED from T-14d. Hardcoded per market — deliberately NOT env-tunable,
   // a maturity is a property of the collateral, not an operator knob.
@@ -84,6 +89,15 @@ export function parseMarketMode(raw: string | undefined, defaultMode: MarketMode
     throw new Error(`${label} must be one of ${MARKET_MODES.join(', ')}, got "${raw}"`);
   }
   return trimmed;
+}
+
+/**
+ * Parse an optional per-market SSR_t margin override (bps). Unset -> undefined (the market
+ * falls back to the global SSR_T_MARGIN_BPS from band-config). Present values get the same
+ * strict whole-number [0, 10000] validation as every other bps env (parseTargetBps).
+ */
+function parseOptionalMarginBps(raw: string | undefined, label: string): number | undefined {
+  return raw === undefined ? undefined : parseTargetBps(raw, 0, label);
 }
 
 // Most markets use 86% LLTV per BA Labs recommendation (02/02/2026). PT-sUSDS/USDS uses 91.5%.
@@ -121,6 +135,7 @@ export const markets: MarketConfig[] = [
     lltv: BigInt(process.env.LLTV_STUSDS || LLTV_86_PERCENT),
     targetBps: parseTargetBps(process.env.TARGET_STUSDS_BPS, 0, 'TARGET_STUSDS_BPS'),
     mode: parseMarketMode(process.env.MODE_STUSDS, 'RETIRED', 'MODE_STUSDS'),
+    ssrTMarginBps: parseOptionalMarginBps(process.env.SSR_T_MARGIN_STUSDS_BPS, 'SSR_T_MARGIN_STUSDS_BPS'),
   },
   {
     name: 'cbBTC/USDS',
@@ -130,6 +145,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_CBBTC_BPS, 667, 'TARGET_CBBTC_BPS'),
     overflowReceiver: true,
     mode: parseMarketMode(process.env.MODE_CBBTC, 'STEERED', 'MODE_CBBTC'),
+    ssrTMarginBps: parseOptionalMarginBps(process.env.SSR_T_MARGIN_CBBTC_BPS, 'SSR_T_MARGIN_CBBTC_BPS'),
   },
   {
     name: 'wstETH/USDS',
@@ -139,6 +155,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_WSTETH_BPS, 667, 'TARGET_WSTETH_BPS'),
     overflowReceiver: true,
     mode: parseMarketMode(process.env.MODE_WSTETH, 'STEERED', 'MODE_WSTETH'),
+    ssrTMarginBps: parseOptionalMarginBps(process.env.SSR_T_MARGIN_WSTETH_BPS, 'SSR_T_MARGIN_WSTETH_BPS'),
   },
   {
     name: 'PT-sUSDS/USDS',
@@ -148,6 +165,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_PTSUSDS_BPS, 666, 'TARGET_PTSUSDS_BPS'),
     absoluteCap: PT_SUSDS_ABSOLUTE_CAP,
     mode: parseMarketMode(process.env.MODE_PTSUSDS, 'SOUNDING', 'MODE_PTSUSDS'),
+    ssrTMarginBps: parseOptionalMarginBps(process.env.SSR_T_MARGIN_PTSUSDS_BPS, 'SSR_T_MARGIN_PTSUSDS_BPS'),
     maturityUtcSec: PT_SUSDS_MATURITY_UTC_SEC,
   },
   {
@@ -158,6 +176,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, 0, 'TARGET_WETH_BPS'),
     maxUtilizationBps: WETH_MAX_UTILIZATION_BPS,
     mode: parseMarketMode(process.env.MODE_WETH, 'STEERED', 'MODE_WETH'),
+    ssrTMarginBps: parseOptionalMarginBps(process.env.SSR_T_MARGIN_WETH_BPS, 'SSR_T_MARGIN_WETH_BPS'),
   },
 ];
 
