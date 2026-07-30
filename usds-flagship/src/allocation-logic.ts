@@ -50,6 +50,14 @@ export interface AllocationInput {
   // the vault. Defaults to 0n (disabled) when omitted. Set this to the bot's dust floor
   // (minAllocationAmount) so retired markets drain down to genuine dust, not to ~0.1%.
   minSweepAmount?: bigint;
+  // Optional explicit per-market sweep (drain-to-zero) flags, one entry per
+  // perMarketAssets[] entry. Sweep semantics for market i are
+  //   sweepByIndex?.[i] ?? (targetPerMarketBpsByIndex[i] === 0)
+  // i.e. when omitted (or an entry is undefined) the legacy rule applies: a target-0
+  // market is a retired market and is swept. Bands mode supplies this so sweeps are
+  // controlled by the band decisions (RETIRED / maturity winddown) rather than inferred
+  // from bps targets, which carry no meaning there.
+  sweepByIndex?: boolean[];
 }
 
 export interface AllocationResult {
@@ -224,6 +232,7 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
     targetPerMarketAmountsByIndex,
     rebalanceThresholdBps,
     minSweepAmount = 0n,
+    sweepByIndex,
   } = input;
 
   if (targetPerMarketBpsByIndex.length !== perMarketAssets.length) {
@@ -234,6 +243,11 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
   if (targetPerMarketAmountsByIndex !== undefined && targetPerMarketAmountsByIndex.length !== perMarketAssets.length) {
     throw new Error(
       `targetPerMarketAmountsByIndex length (${targetPerMarketAmountsByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
+    );
+  }
+  if (sweepByIndex !== undefined && sweepByIndex.length !== perMarketAssets.length) {
+    throw new Error(
+      `sweepByIndex length (${sweepByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
     );
   }
 
@@ -263,7 +277,10 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
     const devBps = Number((diff * 10000n) / totalAssets);
     if (devBps > maxDeviationBps) maxDeviationBps = devBps;
 
-    if (minSweepAmount > 0n && targetBps === 0 && current >= minSweepAmount) {
+    // Sweep flag: explicit per-market override (bands mode) or the legacy
+    // "target-0 means retired" inference.
+    const sweep = sweepByIndex?.[i] ?? (targetBps === 0);
+    if (minSweepAmount > 0n && sweep && current >= minSweepAmount) {
       sweepNeeded = true;
     }
 
@@ -295,15 +312,19 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
 /**
  * Whether a deallocation should execute under the dust filter.
  *
- * Drain-to-zero markets (targetBps === 0) ALWAYS execute, so a retiring market fully
- * empties rather than stranding a sub-floor residual forever (the migration's whole
- * point). For other markets, a negligible trim (desired excess below the floor) is
- * suppressed. The decision is made on the DESIRED (pre-liquidity-cap) excess so that a
- * liquidity-limited large drain still makes incremental progress every run instead of
- * being dropped because this run's withdrawable slice happens to be small.
+ * Drain-to-zero markets ALWAYS execute, so a retiring market fully empties rather than
+ * stranding a sub-floor residual forever (the migration's whole point). For other
+ * markets, a negligible trim (desired excess below the floor) is suppressed. The
+ * decision is made on the DESIRED (pre-liquidity-cap) excess so that a liquidity-limited
+ * large drain still makes incremental progress every run instead of being dropped
+ * because this run's withdrawable slice happens to be small.
+ *
+ * The optional `sweep` flag overrides the drain-to-zero inference: when provided it is
+ * authoritative (bands mode drives sweeps from band decisions, where a zero targetBps
+ * carries no "retired" meaning); when omitted the legacy targetBps === 0 rule applies.
  */
-export function shouldExecuteDeallocate(desiredAmount: bigint, targetBps: number, minAmount: bigint): boolean {
-  if (targetBps === 0) return true;
+export function shouldExecuteDeallocate(desiredAmount: bigint, targetBps: number, minAmount: bigint, sweep?: boolean): boolean {
+  if (sweep ?? (targetBps === 0)) return true;
   return desiredAmount >= minAmount;
 }
 
@@ -321,6 +342,9 @@ export interface DeallocatePlanItem {
   capped: boolean;            // true if cappedAmount < desired due to liquidity
   skipped: boolean;           // true if no withdrawable liquidity at all
   availableLiquidity: bigint;
+  // Optional explicit drain-to-zero flag (see shouldExecuteDeallocate). When omitted the
+  // legacy targetBps === 0 inference applies; bands mode sets it from band decisions.
+  sweep?: boolean;
 }
 
 export type DeallocateOutcome =
@@ -339,7 +363,7 @@ export function planDeallocations(items: DeallocatePlanItem[], minAmount: bigint
     if (it.skipped) {
       return { marketIndex: it.marketIndex, status: 'skip-liquidity', availableLiquidity: it.availableLiquidity };
     }
-    if (!shouldExecuteDeallocate(it.desired, it.targetBps, minAmount)) {
+    if (!shouldExecuteDeallocate(it.desired, it.targetBps, minAmount, it.sweep)) {
       return { marketIndex: it.marketIndex, status: 'skip-dust', desired: it.desired };
     }
     return { marketIndex: it.marketIndex, status: 'execute', amount: it.cappedAmount, capped: it.capped, availableLiquidity: it.availableLiquidity };
