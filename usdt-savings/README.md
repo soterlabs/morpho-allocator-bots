@@ -46,13 +46,39 @@ unprivileged address). The check is:
   transaction, not one per cycle;
 - **independent of the migration** — it is applied even on rounds that migrate nothing (waiting
   on utilization, dust, or already drained), and shares the same atomic batch when both apply;
-- **conservative** — if the route points at some *other* adapter contract, the bot logs a warning
-  and leaves it alone rather than overwriting a curator decision. Set
-  `MANAGE_LIQUIDITY_ADAPTER=false` to opt out entirely.
+- **narrow** — the bot's mandate is *get the route off the old market*, not *own the route*. It
+  only takes over a route that is unset or still points at the old market. A route aimed at
+  another adapter contract, or at a third market, is someone else's decision: the bot logs a
+  warning and leaves it alone rather than overwriting it on every run forever.
+  `MANAGE_LIQUIDITY_ADAPTER=false` opts out entirely.
 
-Note the route is also the first source withdrawals pull from, so after the switch redemptions
-draw on the new market instead of the old; the old market is still drained by the migration
-rounds above.
+Because the vault does **not** validate the address passed to `setLiquidityAdapterAndData` — it
+accepts any address, including an EOA or the zero address — the bot asserts at startup that
+`ADAPTER_ADDRESS` is a registered adapter on the vault (`isAdapter`) and refuses to run otherwise.
+Without that, a mistyped `ADAPTER_ADDRESS` could be written into the vault's route and break every
+subsequent deposit, and the pre-flight simulation would not catch it (the call succeeds).
+
+### Trade-off: the route is also the exit
+
+The route is the first place *withdrawals* pull from too, and Vault V2 has one route pair for both
+directions — you cannot send deposits to one market and redemptions to another. So while the
+migration runs, redemption capacity is bounded by whichever market the route points at. Measured
+on 2026-07-30, with the vault holding no idle:
+
+| | available liquidity | utilization | max single redemption |
+| --- | --- | --- | --- |
+| Old market | 5.25M USDT | 90.03% | ~5,248,501 USDT |
+| New market | 0.33M USDT | 98.65% | ~332,314 USDT |
+
+The new market is thin because the vault is effectively its sole supplier and borrowers have been
+absorbing each round's supply (utilization has sat near 99%), whereas the old market carries
+~14.8M of third-party supply. Redemptions above the route market's liquidity are not stuck —
+users can `forceDeallocate` from the other market for a **0.2%** penalty — but they are degraded.
+
+This is the accepted cost of not growing the deprecated market: pointing the route at the new
+market stops fresh deposits landing in the market being retired, and lowers the new market's
+utilization (and so its borrow rate), which is what pulls borrowers across and frees the old
+market's liquidity for the bot to withdraw. The condition resolves as the migration completes.
 
 ## Markets
 

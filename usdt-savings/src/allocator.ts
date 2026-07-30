@@ -116,15 +116,16 @@ function encodeMarketParams(p: MarketParams): Hex {
   return encodeAbiParameters(MARKET_PARAMS_FIELDS, [p.loanToken, p.collateralToken, p.oracle, p.irm, p.lltv]);
 }
 
-// Morpho Blue market id = keccak256(abi.encode(MarketParams)).
-function computeMarketId(p: MarketParams): Hex {
-  return keccak256(encodeMarketParams(p));
-}
+// abi.encode(MarketParams) for each market — the `data` argument for the vault's
+// allocate/deallocate and the value of its `liquidityData`. The Morpho Blue market id is its
+// keccak256.
+const OLD_MARKET_DATA = encodeMarketParams(oldMarket);
+const NEW_MARKET_DATA = encodeMarketParams(newMarket);
+const OLD_MARKET_ID = keccak256(OLD_MARKET_DATA);
+const NEW_MARKET_ID = keccak256(NEW_MARKET_DATA);
 
 // Fail fast if the configured params don't reproduce the known market ids (wrong oracle/LLTV
 // would silently address the wrong market and move funds incorrectly).
-const OLD_MARKET_ID = computeMarketId(oldMarket);
-const NEW_MARKET_ID = computeMarketId(newMarket);
 if (OLD_MARKET_ID.toLowerCase() !== OLD_MARKET_ID_KNOWN.toLowerCase()) {
   throw new Error(`Old market id mismatch: derived ${OLD_MARKET_ID}, expected ${OLD_MARKET_ID_KNOWN}. Check OLD_ORACLE / LLTV / token addresses.`);
 }
@@ -137,6 +138,7 @@ if (NEW_MARKET_ID.toLowerCase() !== NEW_MARKET_ID_KNOWN.toLowerCase()) {
 const vaultAbi = [
   { name: 'totalAssets', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { name: 'isAllocator', type: 'function', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'bool' }] },
+  { name: 'isAdapter', type: 'function', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'bool' }] },
   {
     name: 'allocate', type: 'function', stateMutability: 'nonpayable',
     inputs: [{ name: 'adapter', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'assets', type: 'uint256' }],
@@ -225,9 +227,9 @@ const usdt = (x: bigint) => `${formatUnits(x, USDT_DECIMALS)} USDT`;
  * For a Morpho market adapter the data is abi.encode(MarketParams), so its keccak256 is the
  * market id; anything that doesn't hash to a market we know is reported verbatim.
  */
-function describeRouteMarket(data: Hex): string {
-  if (!data || data.length <= 2) return 'none (no route data set)';
-  const id = keccak256(data);
+function describeRouteMarket(data: string): string {
+  if (!data || !data.startsWith('0x') || data.length <= 2) return 'none (no route data set)';
+  const id = keccak256(data as Hex);
   if (id.toLowerCase() === NEW_MARKET_ID.toLowerCase()) return `NEW market (${id})`;
   if (id.toLowerCase() === OLD_MARKET_ID.toLowerCase()) return `OLD market (${id})`;
   return `unrecognized market (${id})`;
@@ -319,7 +321,19 @@ async function main() {
   if (threshold !== 1n) throw new Error(`Safe threshold is ${threshold}, expected 1. Bot cannot execute autonomously.`);
   const isAllocator = await publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'isAllocator', args: [config.safeAddress] });
   if (!isAllocator) throw new Error(`Safe ${config.safeAddress} is not an allocator for this vault`);
-  log('Safe ownership, threshold (1), and allocator permission verified');
+
+  // ADAPTER_ADDRESS must be a *registered* adapter on this vault. The vault does NOT validate the
+  // address passed to setLiquidityAdapterAndData — it accepts any address, including an EOA or the
+  // zero address (verified on-chain). So a mistyped ADAPTER_ADDRESS would be written into the
+  // vault's deposit/withdraw route and break every subsequent deposit, and the pre-flight
+  // simulation could not catch it (the call succeeds). Allocate/deallocate would revert on a bad
+  // adapter, but a round that only repoints the route has no allocate to fail on. Fail fast here.
+  const isRegisteredAdapter = await publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'isAdapter', args: [config.adapterAddress] });
+  if (!isRegisteredAdapter) {
+    throw new Error(`ADAPTER_ADDRESS ${config.adapterAddress} is not a registered adapter on vault ${config.vaultAddress}. ` +
+      `Refusing to run: the vault would accept it as the default liquidity route and break deposits.`);
+  }
+  log('Safe ownership, threshold (1), allocator permission, and adapter registration verified');
 
   // Read current state: positions in each market, old-market pool liquidity, vault totals, and
   // the vault's default liquidity route.
@@ -368,7 +382,8 @@ async function main() {
     currentAdapter: liquidityAdapter,
     currentData: liquidityData,
     desiredAdapter: config.adapterAddress,
-    desiredData: encodeMarketParams(newMarket),
+    desiredData: NEW_MARKET_DATA,
+    migrateFromData: OLD_MARKET_DATA,
     enabled: config.manageLiquidityAdapter,
   });
 
@@ -381,15 +396,23 @@ async function main() {
         `${config.adapterAddress}. That is a curator-level choice, so the bot is not overwriting it — ` +
         `new deposits will keep following that adapter. Re-point it manually (or fix ADAPTER_ADDRESS) ` +
         `if this is unexpected.`);
-  } else {
+  } else if (routePlan.status === 'foreign-market') {
+    log(`WARNING: the default liquidity route points at ${describeRouteMarket(routePlan.currentData)} — ` +
+        `neither the old market this bot migrates away from nor the new one. Someone repointed it ` +
+        `deliberately, so the bot is leaving it alone rather than overwriting it every run.`);
+  } else if (routePlan.status === 'update') {
     log(`Default liquidity route currently sends new deposits to ${describeRouteMarket(liquidityData)} — repointing it at the new market.`);
     vaultCalls.push({
       name: `setLiquidityAdapterAndData -> new market (${NEW_MARKET_ID})`,
       calldata: encodeFunctionData({
         abi: vaultAbi, functionName: 'setLiquidityAdapterAndData',
-        args: [config.adapterAddress, encodeMarketParams(newMarket)],
+        args: [config.adapterAddress, NEW_MARKET_DATA],
       }),
     });
+  } else {
+    // Exhaustiveness guard: a future status must not fall through into "send the transaction".
+    const unreachable: never = routePlan;
+    throw new Error(`Unhandled liquidity route plan: ${JSON.stringify(unreachable)}`);
   }
 
   // 2. This round's migration slice, if any.
@@ -410,11 +433,11 @@ async function main() {
     vaultCalls.push(
       {
         name: `deallocate ${usdt(amount)} from old market`,
-        calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'deallocate', args: [config.adapterAddress, encodeMarketParams(oldMarket), amount] }),
+        calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'deallocate', args: [config.adapterAddress, OLD_MARKET_DATA, amount] }),
       },
       {
         name: `allocate ${usdt(amount)} to new market`,
-        calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'allocate', args: [config.adapterAddress, encodeMarketParams(newMarket), amount] }),
+        calldata: encodeFunctionData({ abi: vaultAbi, functionName: 'allocate', args: [config.adapterAddress, NEW_MARKET_DATA, amount] }),
       },
     );
   }

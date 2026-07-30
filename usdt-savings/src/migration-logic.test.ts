@@ -151,6 +151,7 @@ describe('planLiquidityRoute', () => {
       currentData: OLD_DATA,
       desiredAdapter: ADAPTER,
       desiredData: NEW_DATA,
+      migrateFromData: OLD_DATA,
       enabled: true,
       ...overrides,
     };
@@ -182,6 +183,25 @@ describe('planLiquidityRoute', () => {
       status: 'foreign-adapter',
       currentAdapter: foreign,
     });
+  });
+
+  it('refuses to overwrite a route aimed at a third market via our adapter', () => {
+    // The bot's mandate is "get off the OLD market", not "own the route". Without this guard the
+    // bot would fight a curator who repointed the route, overwriting it every run forever.
+    const thirdMarket = '0xcccc';
+    expect(planLiquidityRoute(route({ currentData: thirdMarket }))).toEqual({
+      status: 'foreign-market',
+      currentData: thirdMarket,
+    });
+  });
+
+  it('adopts a route with our adapter but no data set', () => {
+    expect(planLiquidityRoute(route({ currentData: '0x' }))).toEqual({ status: 'update' });
+  });
+
+  it('still takes over the old-market route after a curator flips it back', () => {
+    // Idempotence must not become inaction: old market -> update, every time.
+    expect(planLiquidityRoute(route({ currentData: OLD_DATA }))).toEqual({ status: 'update' });
   });
 
   it('reports disabled when the kill switch is off and a change would be needed', () => {
