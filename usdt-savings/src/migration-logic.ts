@@ -30,6 +30,57 @@ export function maxWithdrawableForUtilization(
   return totalSupplyAssets > minSupplyAfter ? totalSupplyAssets - minSupplyAfter : 0n;
 }
 
+export interface LiquidityRouteInput {
+  // The vault's current `liquidityAdapter()` (zero address = no default route configured).
+  currentAdapter: string;
+  // The vault's current `liquidityData()` — for a Morpho market adapter this is
+  // abi.encode(MarketParams), i.e. it selects which market the route points at.
+  currentData: string;
+  // What the route should be: this bot's adapter, pointed at the NEW market.
+  desiredAdapter: string;
+  desiredData: string;
+  // Ops kill switch (MANAGE_LIQUIDITY_ADAPTER): when false the bot never rewrites the route.
+  enabled: boolean;
+}
+
+export type LiquidityRoutePlan =
+  | { status: 'ok' }
+  | { status: 'update' }
+  | { status: 'foreign-adapter'; currentAdapter: string }
+  | { status: 'disabled' };
+
+/**
+ * Decide whether the vault's default liquidity route (`liquidityAdapter` + `liquidityData`)
+ * needs to be repointed at the NEW market.
+ *
+ * The route is what a plain `deposit` into the vault follows: the vault forwards the deposited
+ * assets straight to `liquidityAdapter` with `liquidityData`, so while it still encodes the OLD
+ * market every new deposit lands back in the market we are draining. Rewriting it is idempotent,
+ * which is why the bot can (and does) re-check it every run.
+ *
+ * Outcomes:
+ *   - 'ok'              — already this bot's adapter pointed at the new market: nothing to do.
+ *   - 'update'          — call setLiquidityAdapterAndData(desiredAdapter, desiredData).
+ *   - 'foreign-adapter' — the route points at some *other* adapter contract; that is a curator
+ *                         decision the bot must not silently overwrite, so it leaves it alone.
+ *   - 'disabled'        — a change is needed but the kill switch is off.
+ *
+ * Address/bytes comparisons are case-insensitive (RPCs return mixed checksum casing).
+ */
+export function planLiquidityRoute(input: LiquidityRouteInput): LiquidityRoutePlan {
+  const { currentAdapter, currentData, desiredAdapter, desiredData, enabled } = input;
+  const eq = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+  if (eq(currentAdapter, desiredAdapter) && eq(currentData, desiredData)) return { status: 'ok' };
+  if (!enabled) return { status: 'disabled' };
+
+  // Zero address = no route at all (deposits sit idle); adopting ours is the intended fix.
+  const unset = /^0x0{40}$/i.test(currentAdapter);
+  if (!unset && !eq(currentAdapter, desiredAdapter)) return { status: 'foreign-adapter', currentAdapter };
+
+  return { status: 'update' };
+}
+
 export interface MigrationInput {
   // The vault's current position in the OLD market (asset units), i.e. how much is left to move.
   oldPosition: bigint;

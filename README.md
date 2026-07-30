@@ -87,7 +87,10 @@ full strategy and setup.
 A **migration bot** (not an idle/allocated strategy): it moves the vault's liquidity from the
 old sUSDS/USDT market (DAI/USD oracle) to the new sUSDS/USDT market (USDS/USD oracle, USDT/USD
 capped at $1.00), draining the old market up to 93% utilization each cycle and waiting above
-it. See [`usdt-savings/README.md`](usdt-savings/README.md). **USDT has 6 decimals.**
+it. It also keeps the vault's **default liquidity route** (`liquidityAdapter` / `liquidityData`
+— where a plain deposit lands) pointed at the new market, so fresh deposits stop flowing into
+the market being drained. See [`usdt-savings/README.md`](usdt-savings/README.md). **USDT has 6
+decimals.**
 
 | Role | Address |
 | --- | --- |
