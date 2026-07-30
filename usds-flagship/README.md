@@ -44,6 +44,37 @@ The bot allocates vault funds according to this strategy:
   drained **must also have its `ORACLE_*` env var set** — a market with no oracle is
   ignored entirely (the bot warns at startup if so).
 
+## Band steering (ALLOCATION_MODE=bands)
+
+The strategy above is the `bps` mode of a required `ALLOCATION_MODE` env
+(`bps` | `bands`, no default). In **bands** mode the static per-market bps
+targets are replaced by **utilization-band steering**: each STEERED market is
+held at 90 / 92 / 93 / 94% utilization depending on where its rate sits
+versus SSR-proportional thresholds (SSR read on-chain from `sUSDS.ssr()`),
+letting the Adaptive Curve IRM drift borrow rates toward `SSR + 15 bps`.
+
+| band | when |
+|---|---|
+| 90% harvest | supply@target ≥ SSR_t (market pays its keep) |
+| 94% drain | supplyApy < 4/7 × SSR |
+| 92% high | supplyApy > 8/7 × SSR |
+| 93% mid | otherwise |
+
+Key guards: 50 bps util deadband, $30k min action, 24 h direction-change
+cooldown (reconstructed from on-chain events), 80% monopolist share gate,
+hard 12% sleeve floor, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
+(REQUIRED in bands mode), SSR sanity bounds [1%, 15%]. Market modes per env:
+`MODE_*` = `STEERED` (cbBTC, wstETH, WETH) | `SOUNDING` (PT-sUSDS: $3M/$1.5M
+demand-discovery tranches, feeds only while util ≥ 95%) | `RETIRED` (stUSDS);
+PT-sUSDS winds down automatically ahead of its 2026-11-26 maturity (grows
+blocked from T−30d, drained from T−14d). Cadence `*/20 * * * *`;
+`BOT_PAUSED=true` is the kill switch; `bps` mode remains the
+**decision-identical** rollback — allocation decisions are unchanged from the
+legacy behavior, while both modes share the hardened fail-loud execution path
+(required `RPC_URL`, non-zero exit on revert/timeout, pending-nonce guard,
+20-minute cadence). Full parameter/env tables, decision-trace format, and
+rule-ID glossary: [`../docs/band-steering.md`](../docs/band-steering.md).
+
 ## Allocation optimizer (read-only)
 
 Computes the yield-maximizing split of the vault's 20% allocated budget across the
