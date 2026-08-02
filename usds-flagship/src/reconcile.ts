@@ -117,6 +117,11 @@ function waterfillDeposits(deposits: ReconcileMarket[], budget: bigint): Map<num
 
   let lo = 0; // fills(lo) > budget
   let hi = Math.max(...deposits.map(m => spotSupplyApy(m.anchorApy, m.totalSupplyAssets, m.totalBorrowAssets)));
+  if (hi <= 0) {
+    // Every deposit market earns nothing right now — there is no "earns most" to rank
+    // by, and depositing into a zero-rate market cannot beat idle. Fill nothing.
+    return new Map(deposits.map(m => [m.index, 0n]));
+  }
   // At the current best spot rate no market accepts a fill, so fills(hi) = 0 <= budget.
   for (let i = 0; i < LEVEL_BISECTION_STEPS; i++) {
     const mid = (lo + hi) / 2;
@@ -164,6 +169,16 @@ function cutWithdrawalsByTiers(withdrawals: ReconcileMarket[], budget: bigint): 
     // max(m.delta, ...) guards the wish bound against pooled-rounding edge cases.
     const pooledSupply = tier.reduce((sum, m) => sum + m.totalSupplyAssets, 0n);
     const pooledBorrow = tier.reduce((sum, m) => sum + m.totalBorrowAssets, 0n);
+    if (pooledBorrow === 0n) {
+      // No borrows in the tier: utilization is 0 whatever we withdraw, so the common-util
+      // formula degenerates — just serve the wishes in order until the budget runs out.
+      for (const m of tier) {
+        const serve = -m.delta < remaining ? m.delta : -remaining;
+        result.set(m.index, serve);
+        remaining += serve;
+      }
+      break;
+    }
     for (const m of tier) {
       const supplyAtCommonUtil = (m.totalBorrowAssets * (pooledSupply - remaining)) / pooledBorrow;
       let cut = supplyAtCommonUtil - m.totalSupplyAssets;
