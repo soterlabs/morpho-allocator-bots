@@ -1,55 +1,46 @@
 /**
- * Band-steering configuration for the Flagship Vault Allocator Bot (Phase A "band steering").
+ * Band-steering configuration for the Flagship Vault Allocator Bot.
  *
- * In bands mode (ALLOCATION_MODE=bands) the 20% sleeve is steered by per-market
- * utilization bands derived from the on-chain Sky Savings Rate instead of static bps
- * targets. This module owns:
+ * In bands mode (ALLOCATION_MODE=bands) the allocated sleeve is steered by
+ * per-market utilization bands chosen from satAPY against thresholds derived
+ * from the on-chain Sky Savings Rate (see band-controller.ts). This module
+ * owns:
  *
  *   - the BandConfig shape and its env parsing/validation (parseBandConfig),
  *   - the SSR RAY -> APY conversion (computeSsrApy),
  *   - the SSR sanity bounds (assertSsrSane) — a bad SSR read must abort the cycle.
  *
- * All defaults are the DECIDED 2026-07-30 parameters. Defaulting here DOCUMENTS the
- * decision rather than masking misconfiguration (per the repo's fail-loud ground rule):
- * every default is a deliberately chosen production value, and the two step caps
- * (MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS) have NO default and are required, because
- * they bound the worst-case fund movement of a single cron cycle.
+ * Every default is a deliberately chosen production value; defaulting here
+ * documents the decision rather than masking misconfiguration (per the repo's
+ * fail-loud ground rule). The two step caps (MAX_ALLOCATE_USDS /
+ * MAX_DEALLOCATE_USDS) have NO default and are required, because they bound
+ * the worst-case fund movement of a single cron cycle.
  *
- * SSR source: sUSDS.ssr() at 0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD — a per-second
- * growth factor in RAY (1e27), e.g. ~1.000000001097e27 for a 3.52% APY.
- * APY = (ssr / 1e27) ^ 31_536_000 - 1.
+ * SSR source: sUSDS.ssr() at 0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD — a
+ * per-second growth factor in RAY (1e27), e.g. ~1.000000001097e27 for a 3.52%
+ * APY. APY = (ssr / 1e27) ^ 31_536_000 - 1.
  */
 
 /**
  * How the bot treats a market in bands mode:
- *   STEERED  — actively steered to a utilization band derived from SSR.
- *   SOUNDING — depth-sounding a new market: feed fixed tranches while demand "sticks"
- *              (utilization stays pinned); never drains.
- *   RETIRED  — drain to zero (sweep semantics).
+ *   STEERED  — steered to a utilization band chosen from satAPY vs SSR_t.
+ *   SOUNDING — reserved; configuring it refuses to start (see parseMarketMode).
+ *   RETIRED  — the bot never touches the market.
  */
 export type MarketMode = 'STEERED' | 'SOUNDING' | 'RETIRED';
 
 export interface BandConfig {
-  lowFracNum: bigint; lowFracDen: bigint;        // 4n, 7n — LOW threshold = 4/7 x SSR
-  highFracNum: bigint; highFracDen: bigint;      // 8n, 7n — HIGH threshold = 8/7 x SSR
-  ssrTMarginBps: number;                          // 15 — SSR_t = SSR + margin
-  bandUtilHarvestBps: number;                     // 9000
-  bandUtilHighBps: number;                        // 9200
-  bandUtilMidBps: number;                         // 9300
-  bandUtilDrainBps: number;                       // 9400
-  utilDeadbandBps: number;                        // 50
-  minBandActionUsds: bigint;                      // 30000e18
-  sleeveFloorBps: number;                         // 1200 — hard sleeve floor, 12% of totalAssets
-  soundingFirstTrancheUsds: bigint;               // 3000000e18
-  soundingNextTrancheUsds: bigint;                // 1500000e18
-  soundingStickUtilBps: number;                   // 9500
-  soundingFeedCooldownHours: number;              // 24
-  directionCooldownHours: number;                 // 24
-  monopolistShareBps: number;                     // 8000
-  ssrMinApyBps: number;                           // 100
-  ssrMaxApyBps: number;                           // 1500
-  maxAllocateUsds: bigint;                        // REQUIRED env
-  maxDeallocateUsds: bigint;                      // REQUIRED env
+  ssrTMarginBps: number;       // SSR_t = SSR + margin
+  ssrTToleranceBps: number;    // HOLD zone = SSR_t +- tolerance
+  utilDeadbandBps: number;     // no action within +-deadband of the band
+  minBandActionUsds: bigint;   // smaller legs are dropped
+  sleeveFloorBps: number;      // hard floor on the allocated sleeve, bps of totalAssets
+  directionCooldownHours: number;
+  monopolistShareBps: number;  // drains allowed only at/above this vault share
+  ssrMinApyBps: number;        // SSR sanity bounds — abort the cycle outside them
+  ssrMaxApyBps: number;
+  maxAllocateUsds: bigint;     // REQUIRED per-cycle step caps
+  maxDeallocateUsds: bigint;
 }
 
 const USDS_WAD = 10n ** 18n; // USDS has 18 decimals
@@ -88,21 +79,7 @@ function parseWholeNumber(raw: string | undefined, defaultValue: number, label: 
 }
 
 /**
- * Parse a threshold-fraction part (numerator or denominator) as bigint.
- * Returns the default ONLY when unset; anything non-canonical throws.
- * Denominator positivity is validated in parseBandConfig (needs both parts).
- */
-function parseFracPart(raw: string | undefined, defaultValue: bigint, label: string): bigint {
-  if (raw === undefined) return defaultValue;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    throw new Error(`${label} must be a non-negative whole number, got "${raw}"`);
-  }
-  return BigInt(trimmed);
-}
-
-/**
- * Parse an amount env expressed in WHOLE USDS (e.g. "30000" = $30k) into 18-dec units.
+ * Parse an amount env expressed in WHOLE USDS (e.g. "100000" = $100k) into 18-dec units.
  * `defaultWholeUsds` is also in whole USDS. Returns the default ONLY when unset;
  * any present non-canonical value throws.
  */
@@ -141,49 +118,30 @@ function parseRequiredPositiveUsds(raw: string | undefined, label: string): bigi
 /**
  * Parse and validate the full band-steering configuration from an env record.
  *
- * Env vars (defaults are the DECIDED 2026-07-30 values):
- *   BAND_LOW_FRAC_NUM / BAND_LOW_FRAC_DEN     — LOW rate threshold as a fraction of SSR (4/7)
- *   BAND_HIGH_FRAC_NUM / BAND_HIGH_FRAC_DEN   — HIGH rate threshold as a fraction of SSR (8/7)
- *   SSR_T_MARGIN_BPS                          — SSR_t = SSR + margin (15)
- *   BAND_UTIL_HARVEST_BPS / _HIGH_BPS / _MID_BPS / _DRAIN_BPS — held-utilization bands
- *                                               (9000 / 9200 / 9300 / 9400)
- *   UTIL_DEADBAND_BPS                         — no action within +-deadband of the band (50)
- *   MIN_BAND_ACTION_USDS                      — min steering action, whole USDS (30000)
- *   SLEEVE_FLOOR_BPS                          — hard sleeve floor as bps of totalAssets (1200)
- *   SOUNDING_FIRST_TRANCHE_USDS / SOUNDING_NEXT_TRANCHE_USDS — whole USDS (3000000 / 1500000)
- *   SOUNDING_STICK_UTIL_BPS                   — feed only while util >= this (9500)
- *   SOUNDING_FEED_COOLDOWN_HOURS              — min hours between feeds (24)
- *   DIRECTION_COOLDOWN_HOURS                  — min hours before reversing direction (24)
- *   MONOPOLIST_SHARE_BPS                      — drains only when vault share >= this (8000)
- *   SSR_MIN_APY_BPS / SSR_MAX_APY_BPS         — SSR sanity bounds, abort outside (100 / 1500)
- *   MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS   — REQUIRED per-cycle step caps, whole USDS, no default
+ * Env vars and defaults:
+ *   SSR_T_MARGIN_BPS            — SSR_t = SSR + margin (25)
+ *   SSR_T_TOLERANCE_BPS         — HOLD zone half-width around SSR_t (25)
+ *   UTIL_DEADBAND_BPS           — no action within +-deadband of the band (50)
+ *   MIN_BAND_ACTION_USDS        — smaller legs are dropped, whole USDS (100000)
+ *   SLEEVE_FLOOR_BPS            — hard sleeve floor as bps of totalAssets (1500)
+ *   DIRECTION_COOLDOWN_HOURS    — min hours before reversing direction (24)
+ *   MONOPOLIST_SHARE_BPS        — drains only when vault share >= this (8000)
+ *   SSR_MIN_APY_BPS / SSR_MAX_APY_BPS — SSR sanity bounds, abort outside (100 / 1500)
+ *   MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS — REQUIRED per-cycle step caps, whole USDS
  *
  * Throws on any invalid or missing-required value. Cross-field validation:
- *   - band monotonicity: drain >= mid >= high >= harvest, harvest > 0 (band 0 would make
- *     the utilization inversion divide by zero)
- *   - LOW fraction < HIGH fraction (cross-multiplied, exact bigint comparison)
- *   - sleeve floor < 2000 bps (the sleeve is 20%; a floor at/above it is nonsensical)
+ *   - tolerance <= margin (the HOLD zone's lower edge is SSR_t - tolerance; a tolerance
+ *     above the margin would accept rates below SSR, the depositor's opportunity cost)
+ *   - sleeve floor < 2000 bps (the sleeve cap is 20%; a floor at/above it is nonsensical)
  *   - SSR sanity bounds ordered (min < max)
- *   - step caps > 0 (enforced by the required parser)
  */
 export function parseBandConfig(env: Record<string, string | undefined>): BandConfig {
   const cfg: BandConfig = {
-    lowFracNum: parseFracPart(env.BAND_LOW_FRAC_NUM, 4n, 'BAND_LOW_FRAC_NUM'),
-    lowFracDen: parseFracPart(env.BAND_LOW_FRAC_DEN, 7n, 'BAND_LOW_FRAC_DEN'),
-    highFracNum: parseFracPart(env.BAND_HIGH_FRAC_NUM, 8n, 'BAND_HIGH_FRAC_NUM'),
-    highFracDen: parseFracPart(env.BAND_HIGH_FRAC_DEN, 7n, 'BAND_HIGH_FRAC_DEN'),
-    ssrTMarginBps: parseBps(env.SSR_T_MARGIN_BPS, 15, 'SSR_T_MARGIN_BPS'),
-    bandUtilHarvestBps: parseBps(env.BAND_UTIL_HARVEST_BPS, 9000, 'BAND_UTIL_HARVEST_BPS'),
-    bandUtilHighBps: parseBps(env.BAND_UTIL_HIGH_BPS, 9200, 'BAND_UTIL_HIGH_BPS'),
-    bandUtilMidBps: parseBps(env.BAND_UTIL_MID_BPS, 9300, 'BAND_UTIL_MID_BPS'),
-    bandUtilDrainBps: parseBps(env.BAND_UTIL_DRAIN_BPS, 9400, 'BAND_UTIL_DRAIN_BPS'),
+    ssrTMarginBps: parseBps(env.SSR_T_MARGIN_BPS, 25, 'SSR_T_MARGIN_BPS'),
+    ssrTToleranceBps: parseBps(env.SSR_T_TOLERANCE_BPS, 25, 'SSR_T_TOLERANCE_BPS'),
     utilDeadbandBps: parseBps(env.UTIL_DEADBAND_BPS, 50, 'UTIL_DEADBAND_BPS'),
-    minBandActionUsds: parseWholeUsds(env.MIN_BAND_ACTION_USDS, 30_000n, 'MIN_BAND_ACTION_USDS'),
-    sleeveFloorBps: parseBps(env.SLEEVE_FLOOR_BPS, 1200, 'SLEEVE_FLOOR_BPS'),
-    soundingFirstTrancheUsds: parseWholeUsds(env.SOUNDING_FIRST_TRANCHE_USDS, 3_000_000n, 'SOUNDING_FIRST_TRANCHE_USDS'),
-    soundingNextTrancheUsds: parseWholeUsds(env.SOUNDING_NEXT_TRANCHE_USDS, 1_500_000n, 'SOUNDING_NEXT_TRANCHE_USDS'),
-    soundingStickUtilBps: parseBps(env.SOUNDING_STICK_UTIL_BPS, 9500, 'SOUNDING_STICK_UTIL_BPS'),
-    soundingFeedCooldownHours: parseWholeNumber(env.SOUNDING_FEED_COOLDOWN_HOURS, 24, 'SOUNDING_FEED_COOLDOWN_HOURS'),
+    minBandActionUsds: parseWholeUsds(env.MIN_BAND_ACTION_USDS, 100_000n, 'MIN_BAND_ACTION_USDS'),
+    sleeveFloorBps: parseBps(env.SLEEVE_FLOOR_BPS, 1500, 'SLEEVE_FLOOR_BPS'),
     directionCooldownHours: parseWholeNumber(env.DIRECTION_COOLDOWN_HOURS, 24, 'DIRECTION_COOLDOWN_HOURS'),
     monopolistShareBps: parseBps(env.MONOPOLIST_SHARE_BPS, 8000, 'MONOPOLIST_SHARE_BPS'),
     ssrMinApyBps: parseBps(env.SSR_MIN_APY_BPS, 100, 'SSR_MIN_APY_BPS'),
@@ -192,34 +150,10 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
     maxDeallocateUsds: parseRequiredPositiveUsds(env.MAX_DEALLOCATE_USDS, 'MAX_DEALLOCATE_USDS'),
   };
 
-  if (cfg.lowFracDen <= 0n) {
-    throw new Error(`BAND_LOW_FRAC_DEN must be > 0, got ${cfg.lowFracDen}`);
-  }
-  if (cfg.highFracDen <= 0n) {
-    throw new Error(`BAND_HIGH_FRAC_DEN must be > 0, got ${cfg.highFracDen}`);
-  }
-  // LOW < HIGH via cross-multiplication (exact, no float division).
-  if (cfg.lowFracNum * cfg.highFracDen >= cfg.highFracNum * cfg.lowFracDen) {
+  if (cfg.ssrTToleranceBps > cfg.ssrTMarginBps) {
     throw new Error(
-      `LOW threshold fraction (${cfg.lowFracNum}/${cfg.lowFracDen}) must be < ` +
-      `HIGH threshold fraction (${cfg.highFracNum}/${cfg.highFracDen})`
-    );
-  }
-  if (!(
-    cfg.bandUtilDrainBps >= cfg.bandUtilMidBps &&
-    cfg.bandUtilMidBps >= cfg.bandUtilHighBps &&
-    cfg.bandUtilHighBps >= cfg.bandUtilHarvestBps
-  )) {
-    throw new Error(
-      `Utilization bands must be monotonic (drain >= mid >= high >= harvest), got ` +
-      `drain=${cfg.bandUtilDrainBps} mid=${cfg.bandUtilMidBps} ` +
-      `high=${cfg.bandUtilHighBps} harvest=${cfg.bandUtilHarvestBps}`
-    );
-  }
-  if (cfg.bandUtilHarvestBps <= 0) {
-    throw new Error(
-      `BAND_UTIL_HARVEST_BPS must be > 0 (a zero band makes the supply inversion divide by zero), ` +
-      `got ${cfg.bandUtilHarvestBps}`
+      `SSR_T_TOLERANCE_BPS (${cfg.ssrTToleranceBps}) must be <= SSR_T_MARGIN_BPS (${cfg.ssrTMarginBps}) — ` +
+      `a wider tolerance would accept rates below SSR itself`
     );
   }
   if (cfg.sleeveFloorBps >= 2000) {

@@ -48,26 +48,34 @@ The bot allocates vault funds according to this strategy:
 
 The strategy above is the `bps` mode of a required `ALLOCATION_MODE` env
 (`bps` | `bands`, no default). In **bands** mode the static per-market bps
-targets are replaced by **utilization-band steering**: each STEERED market is
-held at 90 / 92 / 93 / 94% utilization depending on where its rate sits
-versus SSR-proportional thresholds (SSR read on-chain from `sUSDS.ssr()`),
-letting the Adaptive Curve IRM drift borrow rates toward `SSR + 15 bps`.
+targets are replaced by **satAPY band steering**: each STEERED market is held
+at 90 / 92 / 93 / 94 / 95% utilization depending on where its
+satAPY (= 0.9 x anchor) sits versus thresholds derived from
+SSR_t = SSR + 25 bps (SSR read on-chain from `sUSDS.ssr()`), letting the
+Adaptive Curve IRM drift borrow rates toward the SSR_t +- 25 bps zone. Inside
+the zone the market holds with no action.
 
-| band | when |
+| band | when (satAPY) |
 |---|---|
-| 90% harvest | supply@target ≥ SSR_t (market pays its keep) |
-| 94% drain | supplyApy < 4/7 × SSR |
-| 92% high | supplyApy > 8/7 × SSR |
-| 93% mid | otherwise |
+| 90% | above the zone (top up from idle as demand grows) |
+| hold | inside the zone [SSR_t - 25 bps, SSR_t + 25 bps] |
+| 92% | [2/3 x SSR_t, zone) |
+| 93% | [1/3 x SSR_t, 2/3 x SSR_t) |
+| 94% | [1/12 x SSR_t, 1/3 x SSR_t) |
+| 95% | below 1/12 x SSR_t |
 
-Key guards: 50 bps util deadband, $30k min action, 24 h direction-change
-cooldown (reconstructed from on-chain events), 80% monopolist share gate,
-hard 12% sleeve floor, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
-(REQUIRED in bands mode), SSR sanity bounds [1%, 15%]. Market modes per env:
-`MODE_*` = `STEERED` (cbBTC, wstETH, WETH) | `SOUNDING` (PT-sUSDS: $3M/$1.5M
-demand-discovery tranches, feeds only while util ≥ 95%) | `RETIRED` (stUSDS);
-PT-sUSDS winds down automatically ahead of its 2026-11-26 maturity (grows
-blocked from T−30d, drained from T−14d). Cadence `*/20 * * * *`;
+Per-market gates: 50 bps util deadband, $100k min action, 24 h
+direction-change cooldown (reconstructed from on-chain events), 80%
+monopolist share gate, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
+(REQUIRED in bands mode), SSR sanity bounds [1%, 15%]. The per-market wishes
+are then reconciled against the vault-level sleeve limits (`reconcile.ts`):
+the sleeve ends every batch inside [15%, 20%] of totalAssets — deposits over
+the cap are waterfilled to a common spot rate, withdrawals under the floor
+are cut in band tiers from the deepest band (the marginal tier lands on one
+common utilization), and legs below $100k are dropped.
+
+Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH, WETH, PT-sUSDS) |
+`RETIRED` (stUSDS — never touched). Cadence `*/20 * * * *`;
 `BOT_PAUSED=true` is the kill switch; `bps` mode remains the
 **decision-identical** rollback — allocation decisions are unchanged from the
 legacy behavior, while both modes share the hardened fail-loud execution path

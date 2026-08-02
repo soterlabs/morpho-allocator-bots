@@ -12,14 +12,14 @@
  *             equally between cbBTC and wstETH. WETH is drained only up to 93% market
  *             utilization (waits above it).
  *
- *   'bands' — Phase A utilization-band rate steering. Per-market targets come from
- *             computeBandDecisions (band-controller.ts): STEERED markets are held to a
- *             utilization band chosen from the market's supply APY vs on-chain SSR
- *             thresholds, SOUNDING markets are fed tranches while demand sticks, RETIRED
- *             (and post-maturity PT) markets drain to zero. The decision inputs and the
- *             resulting rules are logged as one BAND_TRACE JSON line per run, including a
- *             log-only 24h anchor-rate projection at post-trade utilization (A/B bracket,
- *             no veto in v1).
+ *   'bands' — satAPY band steering. Per-market targets come from computeBandDecisions
+ *             (band-controller.ts): each STEERED market is held to a utilization band
+ *             chosen from its satAPY vs thresholds derived from the on-chain SSR;
+ *             RETIRED markets are never touched. The per-market wishes are then
+ *             reconciled against the vault-level sleeve limits (reconcile.ts) before
+ *             execution. The decision inputs and the resulting rules are logged as one
+ *             BAND_TRACE JSON line per run, including a log-only 24h anchor-rate
+ *             projection at post-trade utilization (A/B bracket, no veto).
  *
  * Transactions are executed through a Safe 1/3 multisig. The bot is one of the 3 signers
  * and can execute autonomously since the threshold is 1.
@@ -46,6 +46,7 @@ import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, capDealloc
 import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi, encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId } from './market-config.js';
 import { parseBandConfig, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
 import { computeBandDecisions, type MarketObservation, type BandDecision } from './band-controller.js';
+import { reconcileToVaultLimits, type ReconcileMarket } from './reconcile.js';
 import { simulateAnchor, anchorPerSecWadToApy, postTradeUtilizationWad } from './anchor-sim.js';
 import { fetchActionHistory, type ActionHistoryClient } from './onchain-history.js';
 import { computeEffectiveMarketCap } from './optimizer-logic.js';
@@ -106,11 +107,9 @@ const config = {
   // Optional per-market cap on how much to deallocate in a single cycle (USDS). Lets the
   // migration proceed in smaller, gentler steps. 0 (default) means no extra cap — each
   // deallocation is limited only by the target and the pool's available liquidity.
-  // In bands mode MAX_DEALLOCATE_USDS is REQUIRED > 0 (enforced by parseBandConfig). The
-  // band controller clamps STEERED drains to it, so this cap is redundant for those —
-  // but RETIRED / winddown SWEEP decisions target 0 with NO controller-side step clamp,
-  // so this per-cycle cap is the ONLY thing chunking a sweep's drain to
-  // MAX_DEALLOCATE_USDS per cycle. Do not remove it as a bands-mode "no-op".
+  // In bands mode MAX_DEALLOCATE_USDS is REQUIRED > 0 (enforced by parseBandConfig); the
+  // band controller already clamps drains to it, so this executor-side cap is a second,
+  // redundant bound there.
   maxDeallocatePerCycle: parseEther(process.env.MAX_DEALLOCATE_USDS || '0'),
 
   // Upper bound (ms) on waiting for the Safe tx receipt. A hung RPC or a stuck tx must
@@ -167,36 +166,20 @@ if (allocationMode === 'bps') {
     );
   }
 } else {
-  // Bands-mode analog of the undrainable check: static bps sums are meaningless here
-  // (validateTargetBpsSum is deliberately skipped), but a RETIRED-mode market still
-  // cannot be drained without its oracle (the market id derives from it), so any funds
-  // it holds would be stranded. Refuse to start.
-  const undrainable = markets.filter(m => m.mode === 'RETIRED' && m.oracle === '0x0');
-  if (undrainable.length > 0) {
-    throw new Error(
-      `${undrainable.map(m => m.name).join(', ')} have mode=RETIRED but no oracle configured — ` +
-      `a retired market cannot be drained without its oracle. Set their ORACLE_* env vars before running.`
-    );
-  }
-
-  // The direction/feed cooldowns are reconstructed from a BOUNDED event scan
-  // (COOLDOWN_LOOKBACK_BLOCKS). If the scan window is shorter than a configured cooldown,
-  // events older than the window read as undefined ("no recent action") and that cooldown
+  // The direction cooldown is reconstructed from a BOUNDED event scan
+  // (COOLDOWN_LOOKBACK_BLOCKS). If the scan window is shorter than the cooldown,
+  // events older than the window read as undefined ("no recent action") and the cooldown
   // silently stops binding — exactly the masked-misconfig failure mode the repo forbids.
-  // Enforce the coupling: the window (~12s/block) must cover the longest cooldown plus a
+  // Enforce the coupling: the window (~12s/block) must cover the cooldown plus a
   // 1h safety margin for block-time variance. The defaults line up exactly:
   // 7500 blocks x 12s = 90000s = 24h cooldown + 1h margin.
-  const maxCooldownHours = Math.max(
-    bandConfig!.directionCooldownHours,
-    bandConfig!.soundingFeedCooldownHours,
-  );
   const lookbackSec = config.cooldownLookbackBlocks * 12;
-  const requiredSec = maxCooldownHours * 3600 + 3600;
+  const requiredSec = bandConfig!.directionCooldownHours * 3600 + 3600;
   if (lookbackSec < requiredSec) {
     throw new Error(
       `COOLDOWN_LOOKBACK_BLOCKS=${config.cooldownLookbackBlocks} covers only ~${lookbackSec}s at 12s/block, ` +
-      `but the configured cooldowns need >= ${requiredSec}s ` +
-      `(max(DIRECTION_COOLDOWN_HOURS, SOUNDING_FEED_COOLDOWN_HOURS) = ${maxCooldownHours}h + 1h safety margin) — ` +
+      `but the configured cooldown needs >= ${requiredSec}s ` +
+      `(DIRECTION_COOLDOWN_HOURS = ${bandConfig!.directionCooldownHours}h + 1h safety margin) — ` +
       `events falling outside the scan window would silently unbind the cooldown. ` +
       `Raise COOLDOWN_LOOKBACK_BLOCKS or lower the cooldown hours.`
     );
@@ -670,7 +653,6 @@ async function main() {
   // ---- Bands mode: read steering inputs, compute band decisions (bps mode leaves these
   // undefined and the legacy static-target path below runs unchanged). ----
   let bandTargetAmounts: bigint[] | undefined;
-  let bandSweeps: boolean[] | undefined;
   let bandUtilByIndex: (number | undefined)[] | undefined;
 
   if (allocationMode === 'bands') {
@@ -744,12 +726,10 @@ async function main() {
         index: i,
         name: m.name,
         mode: m.mode,
-        maturityUtcSec: m.maturityUtcSec,
         ssrTMarginBps: m.ssrTMarginBps,
         totalSupplyAssets: accrued.totalSupplyAssets,
         totalBorrowAssets: accrued.totalBorrowAssets,
         vaultAssets: pinnedPerMarketAssets[i],
-        supplyApy: accrued.getSupplyApy(block.timestamp),
         anchorApy: anchorPerSecWadToApy(anchorPerSecWad),
         effectiveCap: computeEffectiveMarketCap(pinnedTotalAssets, collateralCapsWad[i], m.absoluteCap),
         lastAllocateAtSec: hist?.lastAllocateAtSec,
@@ -757,25 +737,51 @@ async function main() {
       };
     });
 
-    const decisions: BandDecision[] = computeBandDecisions({ markets: observations, cfg, ssrApy, totalAssets: pinnedTotalAssets, nowSec });
+    const decisions: BandDecision[] = computeBandDecisions({ markets: observations, cfg, ssrApy, nowSec });
 
     // Re-index decisions by market position, failing loud on gaps or duplicates — a
     // malformed decision vector must never silently leave a market unsteered.
-    bandTargetAmounts = new Array<bigint>(configuredMarkets.length);
-    bandSweeps = new Array<boolean>(configuredMarkets.length);
-    bandUtilByIndex = new Array<number | undefined>(configuredMarkets.length);
+    const decisionByIndex = new Array<BandDecision>(configuredMarkets.length);
     const seen = new Set<number>();
     for (const d of decisions) {
       if (d.index < 0 || d.index >= configuredMarkets.length || seen.has(d.index)) {
         throw new Error(`computeBandDecisions returned an invalid or duplicate market index: ${d.index}`);
       }
       seen.add(d.index);
-      bandTargetAmounts[d.index] = d.targetAmount;
-      bandSweeps[d.index] = d.sweep;
-      bandUtilByIndex[d.index] = d.bandUtilBps;
+      decisionByIndex[d.index] = d;
     }
     if (seen.size !== configuredMarkets.length) {
       throw new Error(`computeBandDecisions returned ${seen.size} decisions for ${configuredMarkets.length} markets`);
+    }
+
+    // Reconcile the per-market wishes against the vault-level sleeve limits on the same
+    // pinned snapshot the wishes were computed from. The sleeve cap mirrors the vault's
+    // 20% aggregate adapter cap (config.targetAllocatedPercent); the floor comes from
+    // SLEEVE_FLOOR_BPS.
+    const sleeveUsds = pinnedPerMarketAssets.reduce((sum, x) => sum + x, 0n);
+    const reconcileInputs: ReconcileMarket[] = configuredMarkets.map((m, i) => ({
+      index: i,
+      name: m.name,
+      delta: decisionByIndex[i].targetAmount - pinnedPerMarketAssets[i],
+      bandUtilBps: decisionByIndex[i].bandUtilBps,
+      totalSupplyAssets: observations[i].totalSupplyAssets,
+      totalBorrowAssets: observations[i].totalBorrowAssets,
+      anchorApy: observations[i].anchorApy,
+    }));
+    const legs = reconcileToVaultLimits({
+      markets: reconcileInputs,
+      sleeveUsds,
+      totalAssets: pinnedTotalAssets,
+      sleeveFloorBps: cfg.sleeveFloorBps,
+      sleeveCapBps: config.targetAllocatedPercent,
+      minActionUsds: cfg.minBandActionUsds,
+    });
+
+    bandTargetAmounts = new Array<bigint>(configuredMarkets.length);
+    bandUtilByIndex = new Array<number | undefined>(configuredMarkets.length);
+    for (const leg of legs) {
+      bandTargetAmounts[leg.index] = pinnedPerMarketAssets[leg.index] + leg.delta;
+      bandUtilByIndex[leg.index] = decisionByIndex[leg.index].bandUtilBps;
     }
 
     // A/B borrower-reaction bracket (LOG-ONLY in v1, no veto): for each market with an
@@ -787,19 +793,18 @@ async function main() {
     // 100%, but the real withdraw is liquidity-capped — and a diagnostics-only bracket
     // must never be able to abort the cycle (simulateAnchor throws outside [0, WAD]).
     const bigintsAsStrings = (_: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
-    const bracket = decisions
-      .filter(d => d.targetAmount !== observations[d.index].vaultAssets)
-      .map(d => {
-        const obs = observations[d.index];
-        const delta = d.targetAmount - obs.vaultAssets;
-        const postSupply = obs.totalSupplyAssets + delta;
+    const bracket = legs
+      .filter(leg => leg.delta !== 0n)
+      .map(leg => {
+        const obs = observations[leg.index];
+        const postSupply = obs.totalSupplyAssets + leg.delta;
         const postUtilWad = postTradeUtilizationWad(postSupply, obs.totalBorrowAssets);
         const projectedPerSecWad = simulateAnchor(
-          accruedAnchorPerSecWadByIndex[d.index],
+          accruedAnchorPerSecWadByIndex[leg.index],
           [{ utilizationWad: postUtilWad, durationSec: 86400n }],
         );
         return {
-          index: d.index,
+          index: leg.index,
           name: obs.name,
           postTradeUtilWad: postUtilWad,
           anchorApyNow: obs.anchorApy,
@@ -822,22 +827,20 @@ async function main() {
         reasons: d.reasons,
         targetAmount: d.targetAmount,
         bandUtilBps: d.bandUtilBps,
-        sweep: d.sweep,
+      })),
+      reconciled: legs.map(leg => ({
+        index: leg.index,
+        name: observations[leg.index].name,
+        delta: leg.delta,
+        note: leg.note,
       })),
       bracket,
     }, bigintsAsStrings));
 
-    // Bands-mode rebalance gate: act iff any band target differs from the current
-    // (pinned-snapshot) position beyond the dust floor. (The band controller already
-    // applied its own min-action, deadband, and cooldown gates — this is just
-    // "anything left to do?".)
-    const anyActionable = decisions.some(d => {
-      const current = pinnedPerMarketAssets[d.index];
-      const diff = d.targetAmount > current ? d.targetAmount - current : current - d.targetAmount;
-      return diff >= config.minAllocationAmount;
-    });
-    if (!anyActionable) {
-      log('No band actions needed (all band targets within the dust floor of current positions)');
+    // Bands-mode rebalance gate: reconciliation already dropped every leg below the min
+    // action, so "anything left to do?" is just "any non-zero leg".
+    if (legs.every(leg => leg.delta === 0n)) {
+      log('No band actions needed (all wishes reconciled to holds)');
       return;
     }
   }
@@ -869,9 +872,10 @@ async function main() {
     // bands mode: absolute per-market targets straight from the band decisions.
     // bps mode: bps-derived amounts with PT-sUSDS's absolute cap redistributed.
     targetPerMarketAmountsByIndex: bandTargetAmounts ?? effectiveTargetAmounts,
-    // bands mode: sweeps are decision-driven (RETIRED / maturity winddown) rather than
-    // inferred from targetBps; undefined in bps mode preserves the legacy inference.
-    sweepByIndex: bandSweeps,
+    // bands mode: no sweeps — an explicit all-false vector, because undefined would fall
+    // back to the legacy "targetBps === 0 means sweep" inference and drain markets the
+    // band decisions chose to leave alone. bps mode keeps the legacy inference.
+    sweepByIndex: allocationMode === 'bands' ? configuredMarkets.map(() => false) : undefined,
     // bands mode already gated on "any target beyond the dust floor" above, so the bps
     // deviation threshold is disabled there.
     rebalanceThresholdBps: allocationMode === 'bands' ? 0 : config.rebalanceThresholdBps,
@@ -1022,8 +1026,7 @@ async function main() {
       // bps mode: WETH/USDS (and any market with maxUtilizationBps set) is drained only up
       // to its target utilization (93%), waiting above it; others use the flat
       // supply-reserve cushion. bands mode: the band decision's hold utilization bounds the
-      // drain instead; an undefined bandUtilBps (SOUNDING / harvest grows) keeps the flat
-      // cushion.
+      // drain instead; an undefined bandUtilBps keeps the flat cushion.
       return {
         marketIndex: a.marketIndex,
         totalSupplyAssets,
@@ -1053,9 +1056,9 @@ async function main() {
     capped: c.capped,
     skipped: c.skipped,
     availableLiquidity: c.availableLiquidity,
-    // bands mode drives drain-to-zero semantics explicitly from the band decisions;
+    // bands mode has no sweeps (explicit false, see computeAllocationActions above);
     // undefined in bps mode keeps the legacy targetBps === 0 inference.
-    sweep: bandSweeps?.[c.marketIndex],
+    sweep: allocationMode === 'bands' ? false : undefined,
   }));
 
   // Deallocations execute first in the atomic batch, so by the time the allocations run the

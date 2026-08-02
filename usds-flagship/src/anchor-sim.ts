@@ -90,7 +90,7 @@ export function simulateAnchor(anchorStartPerSecWad: bigint, segments: UtilSegme
  * simulateAnchor's [0, WAD] domain.
  *
  * Why the clamp exists: the bracket projects post-trade utilization from the
- * RAW decision delta, but a sweep (RETIRED / T-14 winddown) or cap-forced
+ * RAW decision delta, but a cap- or floor-forced
  * drain can target more than the pool's idle liquidity, making
  * postSupply < borrow and the raw division exceed WAD. The REAL post-trade
  * utilization can never exceed 100% — the on-chain withdraw is

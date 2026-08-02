@@ -54,19 +54,14 @@ export interface MarketConfig {
   maxUtilizationBps?: number;
   // Bands-mode role of this market (ALLOCATION_MODE=bands; ignored in bps mode):
   //   STEERED  — utilization-band rate steering toward the SSR floor
-  //   SOUNDING — demand sounding: feed tranches while utilization sticks high, never drain
-  //   RETIRED  — drain to zero
+  //   SOUNDING — reserved; configuring it refuses to start (parseMarketMode throws)
+  //   RETIRED  — the bot never touches the market
   // From MODE_* env vars, validated against the enum (parseMarketMode throws on anything else).
   mode: MarketMode;
   // Optional per-market SSR_t margin override (bps) for bands mode, from SSR_T_MARGIN_<MARKET>_BPS
   // env vars. Unset = the market uses the global SSR_T_MARGIN_BPS. Lets PT-sUSDS and the
-  // bluechips carry different harvest hurdles (Kacper: "docelowy rate powinien byc rozny
-  // dla PT-sUSDS i bluechipow").
+  // bluechips carry different rate hurdles.
   ssrTMarginBps?: number;
-  // Optional PT maturity (unix seconds, UTC). Bands mode blocks grows from T-30d and drains
-  // the market like RETIRED from T-14d. Hardcoded per market — deliberately NOT env-tunable,
-  // a maturity is a property of the collateral, not an operator knob.
-  maturityUtcSec?: number;
   encodedParams?: Hex;
 }
 
@@ -81,12 +76,19 @@ const MARKET_MODES: readonly MarketMode[] = ['STEERED', 'SOUNDING', 'RETIRED'];
  * be exactly one of the MarketMode enum members (after trimming) — anything else throws,
  * following the fail-loud posture of parseTargetBps: a typo'd mode must never silently
  * fall back to a default that steers real funds differently than intended.
+ *
+ * SOUNDING is a recognized name with no implementation behind it, so configuring it
+ * also throws — the bot must refuse to start rather than run a market on a strategy
+ * that does not exist.
  */
 export function parseMarketMode(raw: string | undefined, defaultMode: MarketMode, label: string): MarketMode {
   if (raw === undefined) return defaultMode;
   const trimmed = raw.trim() as MarketMode;
   if (!MARKET_MODES.includes(trimmed)) {
     throw new Error(`${label} must be one of ${MARKET_MODES.join(', ')}, got "${raw}"`);
+  }
+  if (trimmed === 'SOUNDING') {
+    throw new Error(`${label}=SOUNDING is not implemented — use STEERED or RETIRED`);
   }
   return trimmed;
 }
@@ -118,10 +120,6 @@ const PT_SUSDS_ABSOLUTE_CAP = parseEther(process.env.PT_SUSDS_ABSOLUTE_CAP_USDS 
 // being retired to 0%; we withdraw only up to 93% utilization and wait above it. Override via
 // env WETH_MAX_UTILIZATION_BPS.
 const WETH_MAX_UTILIZATION_BPS = parseTargetBps(process.env.WETH_MAX_UTILIZATION_BPS, 9300, 'WETH_MAX_UTILIZATION_BPS');
-
-// PT-sUSDS 26 Nov 2026 maturity: 2026-11-26T00:00:00Z. Bands mode blocks grows from T-30d
-// and drains the market like RETIRED from T-14d (see band-controller.ts winddown overlay).
-const PT_SUSDS_MATURITY_UTC_SEC = 1795651200;
 
 // Per-market target defaults (basis points). Override via env vars. Current scheme retires
 // stUSDS and WETH to 0% and splits the 20% allocated target across cbBTC/wstETH/PT-sUSDS
@@ -164,9 +162,8 @@ export const markets: MarketConfig[] = [
     lltv: BigInt(process.env.LLTV_PTSUSDS || LLTV_91_5_PERCENT),
     targetBps: parseTargetBps(process.env.TARGET_PTSUSDS_BPS, 666, 'TARGET_PTSUSDS_BPS'),
     absoluteCap: PT_SUSDS_ABSOLUTE_CAP,
-    mode: parseMarketMode(process.env.MODE_PTSUSDS, 'SOUNDING', 'MODE_PTSUSDS'),
+    mode: parseMarketMode(process.env.MODE_PTSUSDS, 'STEERED', 'MODE_PTSUSDS'),
     ssrTMarginBps: parseOptionalMarginBps(process.env.SSR_T_MARGIN_PTSUSDS_BPS, 'SSR_T_MARGIN_PTSUSDS_BPS'),
-    maturityUtcSec: PT_SUSDS_MATURITY_UTC_SEC,
   },
   {
     name: 'WETH/USDS',
