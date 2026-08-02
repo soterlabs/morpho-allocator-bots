@@ -95,6 +95,16 @@ describe('parseBandConfig', () => {
     it('throws when SSR sanity bounds are not ordered', () => {
       expect(() => parseBandConfig({ ...REQUIRED, SSR_MIN_APY_BPS: '1500' })).toThrow(/SSR_MIN_APY_BPS/);
     });
+
+    it('throws when a step cap is below the min action (the bot could never act)', () => {
+      expect(() => parseBandConfig({ ...REQUIRED, MAX_ALLOCATE_USDS: '50000' })).toThrow(/MIN_BAND_ACTION_USDS/);
+      expect(() => parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '99999' })).toThrow(/MIN_BAND_ACTION_USDS/);
+    });
+
+    it('accepts a step cap equal to the min action', () => {
+      const cfg = parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '100000' });
+      expect(cfg.maxDeallocateUsds).toBe(100_000n * WAD);
+    });
   });
 });
 
@@ -109,10 +119,8 @@ describe('computeSsrApy', () => {
   });
 
   it('round-trips a 3.52% APY (the current SSR)', () => {
-    const perSecond = Math.pow(1.0352, 1 / 31_536_000);
-    // Build the RAY at full double precision: integer part at 1e18 scale, then pad to 1e27.
-    const ray = BigInt(Math.round(perSecond * 1e18)) * 1_000_000_000n;
-    expect(computeSsrApy(ray)).toBeCloseTo(0.0352, 6);
+    // (1.0352)^(1/31536000) in RAY — the per-second rate whose APY is 3.52%.
+    expect(computeSsrApy(1000000001096988928000000000n)).toBeCloseTo(0.0352, 6);
   });
 });
 

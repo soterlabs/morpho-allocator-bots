@@ -49,11 +49,16 @@ export interface MarketObservation {
   lastAllocateAtSec?: number; lastDeallocateAtSec?: number; // undefined = none in lookback window
 }
 
+/** Machine-readable trace key for the decision a market ended on. */
+export type BandRule =
+  | 'R-BAND90' | 'R-BAND92' | 'R-BAND93' | 'R-BAND94' | 'R-BAND95'
+  | 'R-HOLD' | 'R-DEADBAND' | 'R-MINACTION' | 'R-COOLDOWN' | 'R-SHARE' | 'R-RETIRED';
+
 export interface BandDecision {
   index: number;
   targetAmount: bigint;      // absolute vault target for this market this cycle
   bandUtilBps?: number;      // util the market is held to; undefined when there is no band (HOLD / RETIRED)
-  rule: string;              // 'R-BAND90'|'R-HOLD'|'R-BAND92'|'R-BAND93'|'R-BAND94'|'R-BAND95'|'R-DEADBAND'|'R-MINACTION'|'R-COOLDOWN'|'R-SHARE'|'R-RETIRED'
+  rule: BandRule;
   reasons: string[];         // human-readable inputs that fired the rule (include resolved absolute thresholds)
 }
 
@@ -90,6 +95,12 @@ function fmtUtc(sec: number): string {
   return new Date(sec * 1000).toISOString();
 }
 
+type BandUtil = 9000 | 9200 | 9300 | 9400 | 9500;
+
+const BAND_RULE: Record<BandUtil, BandRule> = {
+  9000: 'R-BAND90', 9200: 'R-BAND92', 9300: 'R-BAND93', 9400: 'R-BAND94', 9500: 'R-BAND95',
+};
+
 /**
  * Utilization band (bps) for a market given its satAPY, or 'HOLD' inside the
  * satisfaction zone. Every threshold derives from SSR_t, so a governance SSR change
@@ -102,7 +113,7 @@ function fmtUtc(sec: number): string {
  *   satAPY >= 1/12 x SSR_t        -> 9400
  *   otherwise                     -> 9500  (deepest heating)
  */
-export function pickBand(satApy: number, ssrTApy: number, toleranceApy: number): number | 'HOLD' {
+function pickBand(satApy: number, ssrTApy: number, toleranceApy: number): BandUtil | 'HOLD' {
   if (satApy > ssrTApy + toleranceApy) return 9000;
   if (satApy >= ssrTApy - toleranceApy) return 'HOLD';
   if (satApy >= (2 / 3) * ssrTApy) return 9200;
@@ -129,6 +140,15 @@ export function pickBand(satApy: number, ssrTApy: number, toleranceApy: number):
  */
 function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, nowSec: number): BandDecision {
   const marginBps = m.ssrTMarginBps ?? cfg.ssrTMarginBps;
+  if (marginBps < cfg.ssrTToleranceBps) {
+    // parseBandConfig enforces tolerance <= margin only for the GLOBAL margin; a
+    // per-market override below the tolerance would put the HOLD zone's lower edge
+    // under SSR itself — refuse to steer off it.
+    throw new Error(
+      `${m.name}: SSR_t margin ${marginBps} bps is below the tolerance ${cfg.ssrTToleranceBps} bps — ` +
+      `the HOLD zone would accept rates below SSR`
+    );
+  }
   const ssrT = ssrApy + marginBps / 10000;
   const toleranceApy = cfg.ssrTToleranceBps / 10000;
   const satApy = SAT_APY_FACTOR * m.anchorApy;
@@ -147,7 +167,7 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
     };
   }
 
-  const rule = `R-BAND${band / 100}`;
+  const rule = BAND_RULE[band];
   const reasons: string[] = [
     `satApy ${fmtPct(satApy)} (0.9 x anchor ${fmtPct(m.anchorApy)}) vs SSR_t ${fmtPct(ssrT)} ` +
     `+- ${fmtPct(toleranceApy)} (SSR ${fmtPct(ssrApy)} + ${marginBps} bps` +
@@ -172,7 +192,7 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
     `(delta ${fmtSignedUsds(delta)})`
   );
 
-  const hold = (holdRule: string, why: string): BandDecision => ({
+  const hold = (holdRule: BandRule, why: string): BandDecision => ({
     index: m.index, targetAmount: m.vaultAssets, bandUtilBps: band,
     rule: holdRule, reasons: [...reasons, why],
   });

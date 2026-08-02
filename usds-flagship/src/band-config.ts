@@ -166,6 +166,13 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
       `SSR sanity bounds must be ordered: SSR_MIN_APY_BPS (${cfg.ssrMinApyBps}) < SSR_MAX_APY_BPS (${cfg.ssrMaxApyBps})`
     );
   }
+  if (cfg.maxAllocateUsds < cfg.minBandActionUsds || cfg.maxDeallocateUsds < cfg.minBandActionUsds) {
+    throw new Error(
+      `MAX_ALLOCATE_USDS and MAX_DEALLOCATE_USDS must be >= MIN_BAND_ACTION_USDS ` +
+      `(${cfg.minBandActionUsds / USDS_WAD} USDS) — a step cap below the min action would clamp ` +
+      `every wish under the drop threshold and the bot could never move funds`
+    );
+  }
 
   return cfg;
 }

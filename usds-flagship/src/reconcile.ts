@@ -62,7 +62,7 @@ export interface ReconciledLeg {
  * around the 90% target. Computed in APY space — the same linear-in-APY
  * approximation the controller uses for satAPY, plenty for ranking deposits.
  */
-export function spotSupplyApy(anchorApy: number, totalSupplyAssets: bigint, totalBorrowAssets: bigint): number {
+function spotSupplyApy(anchorApy: number, totalSupplyAssets: bigint, totalBorrowAssets: bigint): number {
   if (totalSupplyAssets <= 0n) return 0;
   const util = Number(totalBorrowAssets) / Number(totalSupplyAssets);
   const err = util >= TARGET_UTILIZATION
@@ -164,31 +164,68 @@ function cutWithdrawalsByTiers(withdrawals: ReconcileMarket[], budget: bigint): 
       remaining -= tierTotal;
       continue;
     }
-    // Marginal tier: pool it and land every member on the common utilization the
-    // remaining budget allows. min(0, ...) skips members already above it; the
-    // max(m.delta, ...) guards the wish bound against pooled-rounding edge cases.
-    const pooledSupply = tier.reduce((sum, m) => sum + m.totalSupplyAssets, 0n);
-    const pooledBorrow = tier.reduce((sum, m) => sum + m.totalBorrowAssets, 0n);
-    if (pooledBorrow === 0n) {
-      // No borrows in the tier: utilization is 0 whatever we withdraw, so the common-util
-      // formula degenerates — just serve the wishes in order until the budget runs out.
-      for (const m of tier) {
-        const serve = -m.delta < remaining ? m.delta : -remaining;
-        result.set(m.index, serve);
-        remaining += serve;
-      }
-      break;
-    }
-    for (const m of tier) {
-      const supplyAtCommonUtil = (m.totalBorrowAssets * (pooledSupply - remaining)) / pooledBorrow;
-      let cut = supplyAtCommonUtil - m.totalSupplyAssets;
-      if (cut > 0n) cut = 0n;
-      if (cut < m.delta) cut = m.delta;
-      result.set(m.index, cut);
-    }
+    cutMarginalTier(tier, remaining, result);
     break; // shallower tiers get nothing this cycle
   }
   return result;
+}
+
+/**
+ * Land the marginal tier on the common utilization the remaining budget allows:
+ * every served member ends at u* = pooledBorrow / (pooledSupply - budget), heating at
+ * the same tempo. The pooled formula conserves the budget only across members it
+ * actually cuts, so members it cannot cut are taken out and the level re-derived —
+ * otherwise their pool weight pushes the others past the budget and through the hard
+ * sleeve floor:
+ *
+ *   - a member already at/above the common utilization takes no cut; dropping it
+ *     lowers u* for the rest (settle loop),
+ *   - a member wished shallower than its formula cut is served at the wish; its size
+ *     leaves the budget and the level is recomputed over everyone not yet served.
+ *
+ * Every settle pass drops a member and every outer pass serves one, so this
+ * terminates. Mutates `result` (all members start at 0).
+ */
+function cutMarginalTier(tier: ReconcileMarket[], budget: bigint, result: Map<number, bigint>): void {
+  let remaining = budget;
+  const servedAtWish = new Set<number>();
+  while (remaining > 0n) {
+    let pool = tier.filter(m => !servedAtWish.has(m.index));
+    let cuts: { m: ReconcileMarket; cut: bigint }[] = [];
+    while (pool.length > 0) {
+      const pooledSupply = pool.reduce((sum, m) => sum + m.totalSupplyAssets, 0n);
+      const pooledBorrow = pool.reduce((sum, m) => sum + m.totalBorrowAssets, 0n);
+      if (pooledBorrow === 0n) {
+        // No borrows in the pool: utilization is 0 whatever we withdraw, so the
+        // common-util formula degenerates — serve the wishes in order instead.
+        for (const m of pool) {
+          const serve = -m.delta < remaining ? m.delta : -remaining;
+          result.set(m.index, serve);
+          remaining += serve;
+        }
+        return;
+      }
+      cuts = pool.map(m => ({
+        m,
+        cut: (m.totalBorrowAssets * (pooledSupply - remaining)) / pooledBorrow - m.totalSupplyAssets,
+      }));
+      const cuttable = cuts.filter(c => c.cut < 0n);
+      if (cuttable.length === cuts.length) break;
+      pool = cuttable.map(c => c.m);
+    }
+    if (pool.length === 0) return;
+
+    const wishBound = cuts.filter(c => c.cut < c.m.delta);
+    if (wishBound.length === 0) {
+      for (const c of cuts) result.set(c.m.index, c.cut);
+      return;
+    }
+    for (const c of wishBound) {
+      result.set(c.m.index, c.m.delta);
+      remaining += c.m.delta;
+      servedAtWish.add(c.m.index);
+    }
+  }
 }
 
 /**

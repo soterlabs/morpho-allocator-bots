@@ -166,6 +166,18 @@ if (allocationMode === 'bps') {
     );
   }
 } else {
+  // Per-market SSR_t margin overrides must respect the same tolerance <= margin
+  // invariant parseBandConfig enforces for the global margin — an override below the
+  // tolerance would put a market's HOLD zone under SSR itself. Refuse to start.
+  const badMargins = markets.filter(
+    m => m.ssrTMarginBps !== undefined && m.ssrTMarginBps < bandConfig!.ssrTToleranceBps);
+  if (badMargins.length > 0) {
+    throw new Error(
+      `${badMargins.map(m => m.name).join(', ')} have SSR_T_MARGIN_<MARKET>_BPS below ` +
+      `SSR_T_TOLERANCE_BPS (${bandConfig!.ssrTToleranceBps}) — the HOLD zone would accept rates below SSR.`
+    );
+  }
+
   // The direction cooldown is reconstructed from a BOUNDED event scan
   // (COOLDOWN_LOOKBACK_BLOCKS). If the scan window is shorter than the cooldown,
   // events older than the window read as undefined ("no recent action") and the cooldown
@@ -863,7 +875,11 @@ async function main() {
       configuredMarkets.map((m, i) => `${m.name}: ${formatEther(effectiveTargetAmounts[i])} USDS`));
   }
 
-  // Compute per-market allocation/deallocation actions
+  // Compute per-market allocation/deallocation actions.
+  // bands mode never sweeps — an explicit all-false vector, because undefined would
+  // fall back to the legacy "targetBps === 0 means sweep" inference and drain markets
+  // the band decisions chose to leave alone. bps mode keeps the legacy inference.
+  const sweepByIndex = allocationMode === 'bands' ? configuredMarkets.map(() => false) : undefined;
   const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
     totalAssets,
@@ -872,10 +888,7 @@ async function main() {
     // bands mode: absolute per-market targets straight from the band decisions.
     // bps mode: bps-derived amounts with PT-sUSDS's absolute cap redistributed.
     targetPerMarketAmountsByIndex: bandTargetAmounts ?? effectiveTargetAmounts,
-    // bands mode: no sweeps — an explicit all-false vector, because undefined would fall
-    // back to the legacy "targetBps === 0 means sweep" inference and drain markets the
-    // band decisions chose to leave alone. bps mode keeps the legacy inference.
-    sweepByIndex: allocationMode === 'bands' ? configuredMarkets.map(() => false) : undefined,
+    sweepByIndex,
     // bands mode already gated on "any target beyond the dust floor" above, so the bps
     // deviation threshold is disabled there.
     rebalanceThresholdBps: allocationMode === 'bands' ? 0 : config.rebalanceThresholdBps,
@@ -1056,9 +1069,7 @@ async function main() {
     capped: c.capped,
     skipped: c.skipped,
     availableLiquidity: c.availableLiquidity,
-    // bands mode has no sweeps (explicit false, see computeAllocationActions above);
-    // undefined in bps mode keeps the legacy targetBps === 0 inference.
-    sweep: allocationMode === 'bands' ? false : undefined,
+    sweep: sweepByIndex?.[c.marketIndex],
   }));
 
   // Deallocations execute first in the atomic batch, so by the time the allocations run the
