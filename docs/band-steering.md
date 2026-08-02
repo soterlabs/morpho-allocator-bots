@@ -117,6 +117,18 @@ Existing allocator envs (`RPC_URL`, `PRIVATE_KEY`, `SAFE_ADDRESS`,
 `VAULT_ADDRESS`, `ADAPTER_ADDRESS`, `ORACLE_*`, `LLTV_*`,
 `PT_SUSDS_ABSOLUTE_CAP_USDS`) are unchanged — see `usds-flagship/README.md`.
 
+## Pre-flight safety checks
+
+The reconciled legs are the only authority on what a cycle may move; before a
+batch is signed the executor re-verifies, on the pinned snapshot: every call
+maps to a leg (same direction, amount not above the leg, the position, or the
+step cap; one call per market), the post-batch sleeve does not cross out of
+[15%, 20%] — or, when drift already put it outside, moves toward the band —
+the adapter's total assets match the sum of the configured positions (an
+invisible position aborts), each anchor read is within [0, 1000%] APY, and
+the pinned block is still canonical. Any violation aborts the cycle with no
+transaction.
+
 ## Decision trace
 
 Every cycle logs one `BAND_TRACE` JSON line: the pinned block, `ssrApy`, a
