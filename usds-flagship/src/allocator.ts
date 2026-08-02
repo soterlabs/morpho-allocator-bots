@@ -47,6 +47,7 @@ import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAb
 import { parseBandConfig, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
 import { computeBandDecisions, type MarketObservation, type BandDecision } from './band-controller.js';
 import { reconcileToVaultLimits, type ReconcileMarket } from './reconcile.js';
+import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
 import { simulateAnchor, anchorPerSecWadToApy, postTradeUtilizationWad } from './anchor-sim.js';
 import { fetchActionHistory, type ActionHistoryClient } from './onchain-history.js';
 import { computeEffectiveMarketCap } from './optimizer-logic.js';
@@ -484,6 +485,8 @@ interface BandPlan {
   utilByIndex: (number | undefined)[];  // band each drain is held to (withdrawal clamp)
   pinnedTotalAssets: bigint;            // the snapshot the targets were computed from
   pinnedPerMarketAssets: bigint[];
+  pinnedBlockNumber: bigint;            // for the pre-execution reorg check
+  pinnedBlockHash: Hex;
 }
 
 /**
@@ -507,7 +510,7 @@ async function computeBandPlan(
   const at = { blockNumber: block.number } as const;
   const nowSec = Number(block.timestamp);
 
-  const [marketStatesRaw, ratesAtTarget, collateralCapsWad, ssrRay, pinnedTotalAssets, pinnedPerMarketAssets] = await Promise.all([
+  const [marketStatesRaw, ratesAtTarget, collateralCapsWad, ssrRay, pinnedTotalAssets, pinnedPerMarketAssets, pinnedAdapterAssets] = await Promise.all([
     Promise.all(marketIds.map(id =>
       publicClient.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: 'market', args: [id], ...at }))),
     Promise.all(marketIds.map(id =>
@@ -518,7 +521,24 @@ async function computeBandPlan(
     publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'totalAssets', ...at }),
     Promise.all(marketIds.map(id =>
       publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [id], ...at }))),
+    publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'realAssets', ...at }),
   ]);
+
+  // Every adapter dollar must be visible to the plan: if the adapter's total assets
+  // and the sum of the configured markets' positions disagree beyond dust, some
+  // position lives in a market this config cannot address (wrong ORACLE_*, missing
+  // market row) — steering and sleeve accounting would silently ignore it. Abort.
+  const visibleAssets = pinnedPerMarketAssets.reduce((sum, x) => sum + x, 0n);
+  const unaccounted = pinnedAdapterAssets > visibleAssets
+    ? pinnedAdapterAssets - visibleAssets
+    : visibleAssets - pinnedAdapterAssets;
+  if (unaccounted > config.minAllocationAmount) {
+    throw new Error(
+      `adapter.realAssets ${formatEther(pinnedAdapterAssets)} USDS differs from the sum of configured ` +
+      `market positions ${formatEther(visibleAssets)} USDS by ${formatEther(unaccounted)} USDS — ` +
+      `a position is invisible to this config (check ORACLE_* / market table). Refusing to steer.`
+    );
+  }
 
   // SSR sanity: abort the run entirely when the read APY falls outside the configured
   // bounds — a bad oracle/RPC value must not steer funds.
@@ -597,7 +617,7 @@ async function computeBandPlan(
   // SLEEVE_FLOOR_BPS. (Downstream, capAllocationsToBudget re-clamps allocations to the
   // room ACTUALLY freed by this batch's deallocations, so a withdrawal shrunk by fresh
   // liquidity cannot push the sleeve past the on-chain cap.)
-  const sleeveUsds = pinnedPerMarketAssets.reduce((sum, x) => sum + x, 0n);
+  const sleeveUsds = visibleAssets;
   const reconcileInputs: ReconcileMarket[] = configuredMarkets.map((m, i) => ({
     index: i,
     name: m.name,
@@ -679,7 +699,13 @@ async function computeBandPlan(
     targetAmounts[leg.index] = pinnedPerMarketAssets[leg.index] + leg.delta;
     utilByIndex[leg.index] = decisionByIndex[leg.index].bandUtilBps;
   }
-  return { targetAmounts, utilByIndex, pinnedTotalAssets, pinnedPerMarketAssets };
+  if (block.hash === null) {
+    throw new Error('pinned block has no hash — cannot arm the pre-execution reorg check');
+  }
+  return {
+    targetAmounts, utilByIndex, pinnedTotalAssets, pinnedPerMarketAssets,
+    pinnedBlockNumber: block.number, pinnedBlockHash: block.hash,
+  };
 }
 
 async function main() {
@@ -1091,7 +1117,7 @@ async function main() {
 
   // Build vault calls: deallocations first, then allocations
   // Order matters: deallocations free up idle balance for subsequent allocations
-  const vaultCalls: { name: string; action: string; amount: bigint; calldata: Hex }[] = [];
+  const vaultCalls: { marketIndex: number; name: string; action: 'allocate' | 'deallocate'; amount: bigint; calldata: Hex }[] = [];
 
   // Plan deallocations via the pure composition, then map outcomes -> log + on-chain call.
   // cappedDeallocations is capDeallocationsToLiquidity(deallocateActions), which maps 1:1
@@ -1127,6 +1153,7 @@ async function main() {
     }
     totalDeallocated += outcome.amount;
     vaultCalls.push({
+      marketIndex: outcome.marketIndex,
       name: market.name,
       action: 'deallocate',
       amount: outcome.amount,
@@ -1172,6 +1199,7 @@ async function main() {
   for (const { marketIndex, amount } of budgetedAllocations) {
     const market = configuredMarkets[marketIndex];
     vaultCalls.push({
+      marketIndex,
       name: market.name,
       action: 'allocate',
       amount,
@@ -1180,6 +1208,24 @@ async function main() {
         functionName: 'allocate',
         args: [config.adapterAddress, market.encodedParams!, amount],
       }),
+    });
+  }
+
+  // Bands mode: re-verify the FINAL batch against the reconciled legs before anything
+  // else sees it — every downstream stage may only shrink a leg, and the batch must
+  // keep the sleeve inside (or moving toward) the [floor, cap] band on the pinned
+  // snapshot. Any violation is a wiring bug or an anomalous read: abort with no tx.
+  if (bandPlan !== undefined) {
+    assertBandBatchSafe({
+      calls: vaultCalls.map((c): PlannedBatchCall => ({ marketIndex: c.marketIndex, action: c.action, amount: c.amount })),
+      legDeltas: configuredMarkets.map((_, i) => bandPlan!.targetAmounts[i] - bandPlan!.pinnedPerMarketAssets[i]),
+      pinnedPerMarketAssets: bandPlan.pinnedPerMarketAssets,
+      pinnedTotalAssets: bandPlan.pinnedTotalAssets,
+      sleeveFloorBps: bandConfig!.sleeveFloorBps,
+      sleeveCapBps: config.targetAllocatedPercent,
+      maxAllocateUsds: bandConfig!.maxAllocateUsds,
+      maxDeallocateUsds: bandConfig!.maxDeallocateUsds,
+      marketNames: configuredMarkets.map(m => m.name),
     });
   }
 
@@ -1211,6 +1257,19 @@ async function main() {
   if (config.dryRun) {
     log('[DRY RUN] Skipping transaction');
     return;
+  }
+
+  // Bands mode: the plan was computed on the pinned block — if a reorg replaced it,
+  // the snapshot no longer describes the chain this batch is about to trade on.
+  // Abort; the next cycle recomputes from scratch.
+  if (bandPlan !== undefined) {
+    const pinnedBlockNow = await publicClient.getBlock({ blockNumber: bandPlan.pinnedBlockNumber });
+    if (pinnedBlockNow.hash !== bandPlan.pinnedBlockHash) {
+      throw new Error(
+        `pinned block ${bandPlan.pinnedBlockNumber} was reorged ` +
+        `(${bandPlan.pinnedBlockHash} -> ${pinnedBlockNow.hash}) — aborting the cycle`
+      );
+    }
   }
 
   // Pack into MultiSend and execute as single Safe transaction. Deliberately NO

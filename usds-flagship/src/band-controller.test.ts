@@ -319,6 +319,24 @@ describe('hold gates', () => {
   });
 });
 
+describe('anchor read sanity', () => {
+  it('throws on a negative anchor read instead of steering off it', () => {
+    expect(() => decide(market({ anchorApy: -0.01 }))).toThrow(/suspect read/);
+  });
+
+  it('throws on an absurd anchor read (above 1000% APY)', () => {
+    expect(() => decide(market({ anchorApy: 12 }))).toThrow(/suspect read/);
+  });
+
+  it('throws on a non-finite anchor read', () => {
+    expect(() => decide(market({ anchorApy: Number.NaN }))).toThrow(/suspect read/);
+  });
+
+  it('still decides at the IRM ceiling (200% APR compounds to ~639% APY)', () => {
+    expect(() => decide(market({ anchorApy: 6.39 }))).not.toThrow();
+  });
+});
+
 describe('market modes', () => {
   it('never touches a RETIRED market', () => {
     const d = decide(market({ mode: 'RETIRED', vaultAssets: parseEther('2000000') }));

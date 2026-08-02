@@ -38,6 +38,13 @@ const SEC_PER_HOUR = 3_600;
  */
 const SAT_APY_FACTOR = 0.9;
 
+/**
+ * Anchor reads above this are garbage: the Adaptive Curve IRM caps rateAtTarget at
+ * 200% APR on-chain, which compounds to ~639% APY — 1000% is unreachable, so
+ * anything beyond it is a corrupted read, not a hot market.
+ */
+const MAX_SANE_ANCHOR_APY = 10;
+
 export interface MarketObservation {
   index: number; name: string; mode: MarketMode;
   // Per-market SSR_t margin override (bps). Falls back to cfg.ssrTMarginBps when unset.
@@ -139,6 +146,14 @@ function pickBand(satApy: number, ssrTApy: number, toleranceApy: number): BandUt
  * maxDeallocateUsds (rule unchanged — the clamp is recorded in reasons).
  */
 function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, nowSec: number): BandDecision {
+  if (!Number.isFinite(m.anchorApy) || m.anchorApy < 0 || m.anchorApy > MAX_SANE_ANCHOR_APY) {
+    // The whole ladder keys off satAPY = 0.9 x anchor, so a corrupted rateAtTarget
+    // read would steer real funds off garbage. Abort the cycle instead.
+    throw new Error(
+      `${m.name}: anchor APY ${m.anchorApy} is outside [0, ${MAX_SANE_ANCHOR_APY}] — ` +
+      `refusing to steer off a suspect read`
+    );
+  }
   const marginBps = m.ssrTMarginBps ?? cfg.ssrTMarginBps;
   if (marginBps < cfg.ssrTToleranceBps) {
     // parseBandConfig enforces tolerance <= margin only for the GLOBAL margin; a
