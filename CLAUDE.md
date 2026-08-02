@@ -16,6 +16,12 @@ deployed as its own Railway cron service.
   (caps decoding, rewards vs native APY, per-adapter positions).
 - `.claude/skills/google-style/` — Google engineering standards for code,
   comments, and tests. Follow for ALL code written in this repo.
+- `.claude/skills/defensive-execution/` — the "may do nothing, must never do
+  something bad" pattern. Read before writing or changing any executor that
+  signs transactions.
+- `.claude/skills/review-hunting/` — bug classes real reviews found here
+  (mixed snapshots, budget conservation under clamps, zombie configs…).
+  Read before reviewing allocator changes.
 
 ## Code style (Google standards — see the google-style skill)
 
