@@ -178,6 +178,17 @@ if (allocationMode === 'bps') {
     );
   }
 
+  // A steered market must be addressable: without an oracle its market id cannot be
+  // derived, so it would be silently dropped from the run — never observed, never
+  // steered, its position invisible to the sleeve accounting. Refuse to start.
+  const unsteerable = markets.filter(m => m.mode !== 'RETIRED' && m.oracle === '0x0');
+  if (unsteerable.length > 0) {
+    throw new Error(
+      `${unsteerable.map(m => m.name).join(', ')} are STEERED but have no oracle configured — ` +
+      `set their ORACLE_* env vars or set MODE_<MARKET>=RETIRED.`
+    );
+  }
+
   // The direction cooldown is reconstructed from a BOUNDED event scan
   // (COOLDOWN_LOOKBACK_BLOCKS). If the scan window is shorter than the cooldown,
   // events older than the window read as undefined ("no recent action") and the cooldown
@@ -468,6 +479,209 @@ async function executeSafeTransaction(
 
 // ============ MAIN ALLOCATOR LOGIC ============
 
+interface BandPlan {
+  targetAmounts: bigint[];              // reconciled absolute vault target per market
+  utilByIndex: (number | undefined)[];  // band each drain is held to (withdrawal clamp)
+  pinnedTotalAssets: bigint;            // the snapshot the targets were computed from
+  pinnedPerMarketAssets: bigint[];
+}
+
+/**
+ * Bands mode: pinned-snapshot reads -> band decisions (band-controller.ts) ->
+ * vault-level reconciliation (reconcile.ts). Logs the BAND_TRACE line. Returns the
+ * reconciled plan, or null when every leg reconciled to zero (nothing to do).
+ */
+async function computeBandPlan(
+  publicClient: ReturnType<typeof createPublicClient>,
+  configuredMarkets: typeof markets,
+  marketIds: Hex[],
+): Promise<BandPlan | null> {
+  const cfg = bandConfig!; // parsed at module load whenever allocationMode === 'bands'
+
+  // Pin every steering read to one block for a consistent snapshot (same pattern as
+  // optimize.ts): market totals, anchor rates, caps, SSR, the vault's totalAssets and
+  // the adapter's per-market positions must all describe the same instant, or the band
+  // inversion (targetVault = vaultAssets + targetSupplyTotal - totalSupplyAssets) mixes
+  // snapshots and mis-sizes actions by whatever lands between the reads.
+  const block = await publicClient.getBlock();
+  const at = { blockNumber: block.number } as const;
+  const nowSec = Number(block.timestamp);
+
+  const [marketStatesRaw, ratesAtTarget, collateralCapsWad, ssrRay, pinnedTotalAssets, pinnedPerMarketAssets] = await Promise.all([
+    Promise.all(marketIds.map(id =>
+      publicClient.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: 'market', args: [id], ...at }))),
+    Promise.all(marketIds.map(id =>
+      publicClient.readContract({ address: IRM_ADAPTIVE, abi: irmAbi, functionName: 'rateAtTarget', args: [id], ...at }))),
+    Promise.all(configuredMarkets.map(m =>
+      publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'relativeCap', args: [computeCollateralCapId(m)], ...at }))),
+    publicClient.readContract({ address: SUSDS, abi: susdsAbi, functionName: 'ssr', ...at }),
+    publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'totalAssets', ...at }),
+    Promise.all(marketIds.map(id =>
+      publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [id], ...at }))),
+  ]);
+
+  // SSR sanity: abort the run entirely when the read APY falls outside the configured
+  // bounds — a bad oracle/RPC value must not steer funds.
+  const ssrApy = computeSsrApy(ssrRay);
+  assertSsrSane(ssrApy, cfg);
+  log(`SSR APY: ${(ssrApy * 100).toFixed(3)}% (ssr ray ${ssrRay})`);
+
+  // Last bot action per market from Morpho Blue Supply/Withdraw events (onBehalf =
+  // adapter), feeding the 24h direction-change cooldown. fetchActionHistory THROWS on
+  // any RPC failure, aborting the cycle — steering blind to recent actions could
+  // ping-pong funds across the cooldown.
+  const fromBlock = block.number > BigInt(config.cooldownLookbackBlocks)
+    ? block.number - BigInt(config.cooldownLookbackBlocks)
+    : 0n;
+  // Cast per ActionHistoryClient's contract: any viem PublicClient satisfies the
+  // structural subset, but the generic getLogs signatures don't unify nominally.
+  const history = await fetchActionHistory(publicClient as unknown as ActionHistoryClient, {
+    morphoBlue: MORPHO_BLUE,
+    adapter: config.adapterAddress,
+    marketIds,
+    fromBlock,
+    toBlock: block.number,
+  });
+
+  // Accrue each market to the pinned block's timestamp via the blue-sdk Market, which
+  // also advances rateAtTarget per the Adaptive Curve IRM. Same construction as
+  // optimizer-logic's toSdkMarket (module-private there, so restated here).
+  // rateAtTarget is optional on the SDK type but always defined here: each Market is
+  // constructed with it and accrueInterest carries the end rate forward.
+  const accruedMarkets = configuredMarkets.map((m, i) => {
+    const [totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, lastUpdate, fee] = marketStatesRaw[i];
+    return new Market({
+      params: new MarketParams({ loanToken: USDS, collateralToken: m.collateral, oracle: m.oracle, irm: IRM_ADAPTIVE, lltv: m.lltv }),
+      totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares,
+      lastUpdate, fee,
+      rateAtTarget: ratesAtTarget[i],
+    }).accrueInterest(block.timestamp);
+  });
+  const observations: MarketObservation[] = configuredMarkets.map((m, i) => {
+    const hist = history.get(marketIds[i].toLowerCase());
+    return {
+      index: i,
+      name: m.name,
+      mode: m.mode,
+      ssrTMarginBps: m.ssrTMarginBps,
+      totalSupplyAssets: accruedMarkets[i].totalSupplyAssets,
+      totalBorrowAssets: accruedMarkets[i].totalBorrowAssets,
+      vaultAssets: pinnedPerMarketAssets[i],
+      anchorApy: anchorPerSecWadToApy(accruedMarkets[i].rateAtTarget!),
+      effectiveCap: computeEffectiveMarketCap(pinnedTotalAssets, collateralCapsWad[i], m.absoluteCap),
+      lastAllocateAtSec: hist?.lastAllocateAtSec,
+      lastDeallocateAtSec: hist?.lastDeallocateAtSec,
+    };
+  });
+
+  const decisions: BandDecision[] = computeBandDecisions({ markets: observations, cfg, ssrApy, nowSec });
+
+  // Re-index decisions by market position, failing loud on gaps or duplicates — a
+  // malformed decision vector must never silently leave a market unsteered.
+  const decisionByIndex = new Array<BandDecision>(configuredMarkets.length);
+  const seen = new Set<number>();
+  for (const d of decisions) {
+    if (d.index < 0 || d.index >= configuredMarkets.length || seen.has(d.index)) {
+      throw new Error(`computeBandDecisions returned an invalid or duplicate market index: ${d.index}`);
+    }
+    seen.add(d.index);
+    decisionByIndex[d.index] = d;
+  }
+  if (seen.size !== configuredMarkets.length) {
+    throw new Error(`computeBandDecisions returned ${seen.size} decisions for ${configuredMarkets.length} markets`);
+  }
+
+  // Reconcile the per-market wishes against the vault-level sleeve limits on the same
+  // pinned snapshot the wishes were computed from. The sleeve cap mirrors the vault's
+  // 20% aggregate adapter cap (config.targetAllocatedPercent); the floor comes from
+  // SLEEVE_FLOOR_BPS. (Downstream, capAllocationsToBudget re-clamps allocations to the
+  // room ACTUALLY freed by this batch's deallocations, so a withdrawal shrunk by fresh
+  // liquidity cannot push the sleeve past the on-chain cap.)
+  const sleeveUsds = pinnedPerMarketAssets.reduce((sum, x) => sum + x, 0n);
+  const reconcileInputs: ReconcileMarket[] = configuredMarkets.map((m, i) => ({
+    index: i,
+    name: m.name,
+    delta: decisionByIndex[i].targetAmount - pinnedPerMarketAssets[i],
+    bandUtilBps: decisionByIndex[i].bandUtilBps,
+    totalSupplyAssets: observations[i].totalSupplyAssets,
+    totalBorrowAssets: observations[i].totalBorrowAssets,
+    anchorApy: observations[i].anchorApy,
+  }));
+  const legs = reconcileToVaultLimits({
+    markets: reconcileInputs,
+    sleeveUsds,
+    totalAssets: pinnedTotalAssets,
+    sleeveFloorBps: cfg.sleeveFloorBps,
+    sleeveCapBps: config.targetAllocatedPercent,
+    minActionUsds: cfg.minBandActionUsds,
+  });
+
+  // A/B borrower-reaction bracket (LOG-ONLY, no veto): for each market with an
+  // action, project the anchor 24h ahead as if utilization held at the post-trade
+  // level. simulateAnchor takes explicit segments and must not merge/split them (wExp
+  // drift is segmentation-dependent); one 24h segment IS this bracket's definition.
+  // postTradeUtilizationWad clamps the projection into [0, WAD]: a cap- or floor-forced
+  // drain can exceed the pool's idle liquidity, pushing the RAW post-trade util past
+  // 100%, but the real withdraw is liquidity-capped — and a diagnostics-only bracket
+  // must never be able to abort the cycle (simulateAnchor throws outside [0, WAD]).
+  const bigintsAsStrings = (_: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
+  const bracket = legs
+    .filter(leg => leg.delta !== 0n)
+    .map(leg => {
+      const obs = observations[leg.index];
+      const postSupply = obs.totalSupplyAssets + leg.delta;
+      const postUtilWad = postTradeUtilizationWad(postSupply, obs.totalBorrowAssets);
+      const projectedPerSecWad = simulateAnchor(
+        accruedMarkets[leg.index].rateAtTarget!,
+        [{ utilizationWad: postUtilWad, durationSec: 86400n }],
+      );
+      return {
+        index: leg.index,
+        name: obs.name,
+        postTradeUtilWad: postUtilWad,
+        anchorApyNow: obs.anchorApy,
+        anchorApyIn24h: anchorPerSecWadToApy(projectedPerSecWad),
+      };
+    });
+
+  // Full decision trace as one grep-able JSON line. configSha256 fingerprints the
+  // PARSED BandConfig (not raw env), so any effective-parameter change shows up.
+  const configSha256 = createHash('sha256').update(JSON.stringify(cfg, bigintsAsStrings)).digest('hex');
+  console.log('BAND_TRACE ' + JSON.stringify({
+    block: block.number,
+    ts: block.timestamp,
+    ssrApy,
+    configSha256,
+    decisions: decisions.map(d => ({
+      index: d.index,
+      name: observations[d.index].name,
+      rule: d.rule,
+      reasons: d.reasons,
+      targetAmount: d.targetAmount,
+      bandUtilBps: d.bandUtilBps,
+    })),
+    reconciled: legs.map(leg => ({
+      index: leg.index,
+      name: observations[leg.index].name,
+      delta: leg.delta,
+      note: leg.note,
+    })),
+    bracket,
+  }, bigintsAsStrings));
+
+  // Reconciliation already dropped every leg below the min action, so "anything left
+  // to do?" is just "any non-zero leg".
+  if (legs.every(leg => leg.delta === 0n)) return null;
+
+  const targetAmounts = new Array<bigint>(configuredMarkets.length);
+  const utilByIndex = new Array<number | undefined>(configuredMarkets.length);
+  for (const leg of legs) {
+    targetAmounts[leg.index] = pinnedPerMarketAssets[leg.index] + leg.delta;
+    utilByIndex[leg.index] = decisionByIndex[leg.index].bandUtilBps;
+  }
+  return { targetAmounts, utilByIndex, pinnedTotalAssets, pinnedPerMarketAssets };
+}
+
 async function main() {
   log('=== Flagship Vault Allocator Bot ===');
   log(`Mode: ${config.dryRun ? 'DRY RUN' : 'LIVE'} | allocation mode: ${allocationMode}`);
@@ -662,199 +876,17 @@ async function main() {
     log(`  ${configuredMarkets[i].name}: ${formatEther(perMarketAssets[i])} USDS`);
   }
 
-  // ---- Bands mode: read steering inputs, compute band decisions (bps mode leaves these
-  // undefined and the legacy static-target path below runs unchanged). ----
-  let bandTargetAmounts: bigint[] | undefined;
-  let bandUtilByIndex: (number | undefined)[] | undefined;
-
+  // ---- Bands mode: pinned-snapshot reads -> band decisions -> vault-level
+  // reconciliation (computeBandPlan). bps mode leaves the plan undefined and the
+  // legacy static-target path below runs unchanged. ----
+  let bandPlan: BandPlan | undefined;
   if (allocationMode === 'bands') {
-    const cfg = bandConfig!; // parsed at module load whenever allocationMode === 'bands'
-
-    // Pin every steering read to one block for a consistent snapshot (same pattern as
-    // optimize.ts): market totals, anchor rates, caps, SSR, the vault's totalAssets and
-    // the adapter's per-market positions must all describe the same instant, or the band
-    // inversion (targetVault = vaultAssets + targetSupplyTotal - totalSupplyAssets) mixes
-    // snapshots and mis-sizes actions by whatever lands between the reads. totalAssets and
-    // perMarketAssets were read above at 'latest' for logging/bps use; bands RE-reads both
-    // here at the pinned block and uses only the pinned values for its decisions.
-    const block = await publicClient.getBlock();
-    const at = { blockNumber: block.number } as const;
-    const nowSec = Number(block.timestamp);
-
-    const [marketStatesRaw, ratesAtTarget, collateralCapsWad, ssrRay, pinnedTotalAssets, pinnedPerMarketAssets] = await Promise.all([
-      Promise.all(marketIds.map(id =>
-        publicClient.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: 'market', args: [id], ...at }))),
-      Promise.all(marketIds.map(id =>
-        publicClient.readContract({ address: IRM_ADAPTIVE, abi: irmAbi, functionName: 'rateAtTarget', args: [id], ...at }))),
-      Promise.all(configuredMarkets.map(m =>
-        publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'relativeCap', args: [computeCollateralCapId(m)], ...at }))),
-      publicClient.readContract({ address: SUSDS, abi: susdsAbi, functionName: 'ssr', ...at }),
-      publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'totalAssets', ...at }),
-      Promise.all(marketIds.map(id =>
-        publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [id], ...at }))),
-    ]);
-
-    // SSR sanity: abort the run entirely when the read APY falls outside the configured
-    // bounds — a bad oracle/RPC value must not steer funds.
-    const ssrApy = computeSsrApy(ssrRay);
-    assertSsrSane(ssrApy, cfg);
-    log(`SSR APY: ${(ssrApy * 100).toFixed(3)}% (ssr ray ${ssrRay})`);
-
-    // Last bot action per market from Morpho Blue Supply/Withdraw events (onBehalf =
-    // adapter), feeding the 24h direction-change cooldown. fetchActionHistory THROWS on
-    // any RPC failure, aborting the cycle — steering blind to recent actions could
-    // ping-pong funds across the cooldown.
-    const fromBlock = block.number > BigInt(config.cooldownLookbackBlocks)
-      ? block.number - BigInt(config.cooldownLookbackBlocks)
-      : 0n;
-    // Cast per ActionHistoryClient's contract: any viem PublicClient satisfies the
-    // structural subset, but the generic getLogs signatures don't unify nominally.
-    const history = await fetchActionHistory(publicClient as unknown as ActionHistoryClient, {
-      morphoBlue: MORPHO_BLUE,
-      adapter: config.adapterAddress,
-      marketIds,
-      fromBlock,
-      toBlock: block.number,
-    });
-
-    // Accrue each market to the pinned block's timestamp via the blue-sdk Market, which
-    // also advances rateAtTarget per the Adaptive Curve IRM. Same construction as
-    // optimizer-logic's toSdkMarket (module-private there, so restated here).
-    const accruedAnchorPerSecWadByIndex: bigint[] = [];
-    const observations: MarketObservation[] = configuredMarkets.map((m, i) => {
-      const [totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, lastUpdate, fee] = marketStatesRaw[i];
-      const accrued = new Market({
-        params: new MarketParams({ loanToken: USDS, collateralToken: m.collateral, oracle: m.oracle, irm: IRM_ADAPTIVE, lltv: m.lltv }),
-        totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares,
-        lastUpdate, fee,
-        rateAtTarget: ratesAtTarget[i],
-      }).accrueInterest(block.timestamp);
-      // rateAtTarget is optional on the SDK type but always defined here: the Market was
-      // constructed with it and accrueInterest carries the end rate forward.
-      const anchorPerSecWad = accrued.rateAtTarget!;
-      accruedAnchorPerSecWadByIndex.push(anchorPerSecWad);
-      const hist = history.get(marketIds[i].toLowerCase());
-      return {
-        index: i,
-        name: m.name,
-        mode: m.mode,
-        ssrTMarginBps: m.ssrTMarginBps,
-        totalSupplyAssets: accrued.totalSupplyAssets,
-        totalBorrowAssets: accrued.totalBorrowAssets,
-        vaultAssets: pinnedPerMarketAssets[i],
-        anchorApy: anchorPerSecWadToApy(anchorPerSecWad),
-        effectiveCap: computeEffectiveMarketCap(pinnedTotalAssets, collateralCapsWad[i], m.absoluteCap),
-        lastAllocateAtSec: hist?.lastAllocateAtSec,
-        lastDeallocateAtSec: hist?.lastDeallocateAtSec,
-      };
-    });
-
-    const decisions: BandDecision[] = computeBandDecisions({ markets: observations, cfg, ssrApy, nowSec });
-
-    // Re-index decisions by market position, failing loud on gaps or duplicates — a
-    // malformed decision vector must never silently leave a market unsteered.
-    const decisionByIndex = new Array<BandDecision>(configuredMarkets.length);
-    const seen = new Set<number>();
-    for (const d of decisions) {
-      if (d.index < 0 || d.index >= configuredMarkets.length || seen.has(d.index)) {
-        throw new Error(`computeBandDecisions returned an invalid or duplicate market index: ${d.index}`);
-      }
-      seen.add(d.index);
-      decisionByIndex[d.index] = d;
-    }
-    if (seen.size !== configuredMarkets.length) {
-      throw new Error(`computeBandDecisions returned ${seen.size} decisions for ${configuredMarkets.length} markets`);
-    }
-
-    // Reconcile the per-market wishes against the vault-level sleeve limits on the same
-    // pinned snapshot the wishes were computed from. The sleeve cap mirrors the vault's
-    // 20% aggregate adapter cap (config.targetAllocatedPercent); the floor comes from
-    // SLEEVE_FLOOR_BPS.
-    const sleeveUsds = pinnedPerMarketAssets.reduce((sum, x) => sum + x, 0n);
-    const reconcileInputs: ReconcileMarket[] = configuredMarkets.map((m, i) => ({
-      index: i,
-      name: m.name,
-      delta: decisionByIndex[i].targetAmount - pinnedPerMarketAssets[i],
-      bandUtilBps: decisionByIndex[i].bandUtilBps,
-      totalSupplyAssets: observations[i].totalSupplyAssets,
-      totalBorrowAssets: observations[i].totalBorrowAssets,
-      anchorApy: observations[i].anchorApy,
-    }));
-    const legs = reconcileToVaultLimits({
-      markets: reconcileInputs,
-      sleeveUsds,
-      totalAssets: pinnedTotalAssets,
-      sleeveFloorBps: cfg.sleeveFloorBps,
-      sleeveCapBps: config.targetAllocatedPercent,
-      minActionUsds: cfg.minBandActionUsds,
-    });
-
-    bandTargetAmounts = new Array<bigint>(configuredMarkets.length);
-    bandUtilByIndex = new Array<number | undefined>(configuredMarkets.length);
-    for (const leg of legs) {
-      bandTargetAmounts[leg.index] = pinnedPerMarketAssets[leg.index] + leg.delta;
-      bandUtilByIndex[leg.index] = decisionByIndex[leg.index].bandUtilBps;
-    }
-
-    // A/B borrower-reaction bracket (LOG-ONLY in v1, no veto): for each market with an
-    // action, project the anchor 24h ahead as if utilization held at the post-trade
-    // level. simulateAnchor takes explicit segments and must not merge/split them (wExp
-    // drift is segmentation-dependent); one 24h segment IS this bracket's definition.
-    // postTradeUtilizationWad clamps the projection into [0, WAD]: a sweep or cap-forced
-    // drain can exceed the pool's idle liquidity, pushing the RAW post-trade util past
-    // 100%, but the real withdraw is liquidity-capped — and a diagnostics-only bracket
-    // must never be able to abort the cycle (simulateAnchor throws outside [0, WAD]).
-    const bigintsAsStrings = (_: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
-    const bracket = legs
-      .filter(leg => leg.delta !== 0n)
-      .map(leg => {
-        const obs = observations[leg.index];
-        const postSupply = obs.totalSupplyAssets + leg.delta;
-        const postUtilWad = postTradeUtilizationWad(postSupply, obs.totalBorrowAssets);
-        const projectedPerSecWad = simulateAnchor(
-          accruedAnchorPerSecWadByIndex[leg.index],
-          [{ utilizationWad: postUtilWad, durationSec: 86400n }],
-        );
-        return {
-          index: leg.index,
-          name: obs.name,
-          postTradeUtilWad: postUtilWad,
-          anchorApyNow: obs.anchorApy,
-          anchorApyIn24h: anchorPerSecWadToApy(projectedPerSecWad),
-        };
-      });
-
-    // Full decision trace as one grep-able JSON line. configSha256 fingerprints the
-    // PARSED BandConfig (not raw env), so any effective-parameter change shows up.
-    const configSha256 = createHash('sha256').update(JSON.stringify(cfg, bigintsAsStrings)).digest('hex');
-    console.log('BAND_TRACE ' + JSON.stringify({
-      block: block.number,
-      ts: block.timestamp,
-      ssrApy,
-      configSha256,
-      decisions: decisions.map(d => ({
-        index: d.index,
-        name: observations[d.index].name,
-        rule: d.rule,
-        reasons: d.reasons,
-        targetAmount: d.targetAmount,
-        bandUtilBps: d.bandUtilBps,
-      })),
-      reconciled: legs.map(leg => ({
-        index: leg.index,
-        name: observations[leg.index].name,
-        delta: leg.delta,
-        note: leg.note,
-      })),
-      bracket,
-    }, bigintsAsStrings));
-
-    // Bands-mode rebalance gate: reconciliation already dropped every leg below the min
-    // action, so "anything left to do?" is just "any non-zero leg".
-    if (legs.every(leg => leg.delta === 0n)) {
+    const plan = await computeBandPlan(publicClient, configuredMarkets, marketIds);
+    if (plan === null) {
       log('No band actions needed (all wishes reconciled to holds)');
       return;
     }
+    bandPlan = plan;
   }
 
   // Compute effective per-market target AMOUNTS. This applies PT-sUSDS's 5M absolute cap and
@@ -882,12 +914,16 @@ async function main() {
   const sweepByIndex = allocationMode === 'bands' ? configuredMarkets.map(() => false) : undefined;
   const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
-    totalAssets,
-    perMarketAssets,
+    // bands mode: act on the SAME pinned snapshot the reconciled targets were computed
+    // from — mixing the earlier 'latest' reads with pinned targets would let read drift
+    // between the two batches fabricate or resize actions (the threshold gate is 0 here,
+    // so even dust-level drift on a zero-delta leg would become an on-chain action).
+    totalAssets: bandPlan?.pinnedTotalAssets ?? totalAssets,
+    perMarketAssets: bandPlan?.pinnedPerMarketAssets ?? perMarketAssets,
     targetPerMarketBpsByIndex,
-    // bands mode: absolute per-market targets straight from the band decisions.
+    // bands mode: absolute per-market targets from the reconciled band plan.
     // bps mode: bps-derived amounts with PT-sUSDS's absolute cap redistributed.
-    targetPerMarketAmountsByIndex: bandTargetAmounts ?? effectiveTargetAmounts,
+    targetPerMarketAmountsByIndex: bandPlan?.targetAmounts ?? effectiveTargetAmounts,
     sweepByIndex,
     // bands mode already gated on "any target beyond the dust floor" above, so the bps
     // deviation threshold is disabled there.
@@ -987,8 +1023,8 @@ async function main() {
     // bands mode: the cap target is the band decision's absolute amount (computed off the
     // pinned snapshot; step caps and effectiveCap already applied by the controller).
     // bps mode: the bps target recomputed against fresh totalAssets, as before.
-    const targetAmount = bandTargetAmounts !== undefined
-      ? bandTargetAmounts[a.marketIndex]
+    const targetAmount = bandPlan !== undefined
+      ? bandPlan.targetAmounts[a.marketIndex]
       : freshEffectiveTargets[a.marketIndex];
     const onchainCapWad = onchainRelativeCapWadByIndex.get(a.marketIndex);
     const onchainCapLimit = onchainCapWad !== undefined
@@ -1044,8 +1080,8 @@ async function main() {
         marketIndex: a.marketIndex,
         totalSupplyAssets,
         totalBorrowAssets,
-        maxUtilizationBps: bandUtilByIndex !== undefined
-          ? bandUtilByIndex[a.marketIndex]
+        maxUtilizationBps: bandPlan !== undefined
+          ? bandPlan.utilByIndex[a.marketIndex]
           : configuredMarkets[a.marketIndex].maxUtilizationBps,
       };
     });

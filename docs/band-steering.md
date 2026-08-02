@@ -95,7 +95,7 @@ fly.
 | `ALLOCATION_MODE` | **REQUIRED** | `bps` \| `bands`, no default. `bps` = static-target allocation decisions unchanged (incl. `validateTargetBpsSum`); fail-loud execution hardening is shared by both modes |
 | `BOT_PAUSED` | `false` | `true` → log `paused`, exit 0 |
 | `MAX_ALLOCATE_USDS` | **REQUIRED** (≥ min action) | per-market per-cycle grow step cap, whole USDS |
-| `MAX_DEALLOCATE_USDS` | **REQUIRED** (> 0) | per-market per-cycle drain step cap (in `bps` mode stays optional, `0` = no cap) |
+| `MAX_DEALLOCATE_USDS` | **REQUIRED** (≥ min action) | per-market per-cycle drain step cap (in `bps` mode stays optional, `0` = no cap) |
 | `SSR_T_MARGIN_BPS` | `25` | global SSR_t margin for STEERED markets |
 | `SSR_T_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global; validated ≥ tolerance |
 | `SSR_T_TOLERANCE_BPS` | `25` | zone half-width; validated ≤ margin |

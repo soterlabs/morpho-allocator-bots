@@ -164,7 +164,7 @@ function cutWithdrawalsByTiers(withdrawals: ReconcileMarket[], budget: bigint): 
       remaining -= tierTotal;
       continue;
     }
-    cutMarginalTier(tier, remaining, result);
+    for (const [index, cut] of cutMarginalTier(tier, remaining)) result.set(index, cut);
     break; // shallower tiers get nothing this cycle
   }
   return result;
@@ -174,58 +174,63 @@ function cutWithdrawalsByTiers(withdrawals: ReconcileMarket[], budget: bigint): 
  * Land the marginal tier on the common utilization the remaining budget allows:
  * every served member ends at u* = pooledBorrow / (pooledSupply - budget), heating at
  * the same tempo. The pooled formula conserves the budget only across members it
- * actually cuts, so members it cannot cut are taken out and the level re-derived —
- * otherwise their pool weight pushes the others past the budget and through the hard
- * sleeve floor:
+ * actually cuts, so each pass re-derives the level over a corrected pool — otherwise
+ * an uncuttable member's pool weight pushes the others past the budget and through
+ * the hard sleeve floor:
  *
- *   - a member already at/above the common utilization takes no cut; dropping it
- *     lowers u* for the rest (settle loop),
+ *   - a member already at/above the common utilization takes no cut and leaves the
+ *     pool for this pass,
  *   - a member wished shallower than its formula cut is served at the wish; its size
  *     leaves the budget and the level is recomputed over everyone not yet served.
  *
- * Every settle pass drops a member and every outer pass serves one, so this
- * terminates. Mutates `result` (all members start at 0).
+ * Every pass shrinks the pool or serves a member, so this terminates. Returns the
+ * final withdrawal (<= 0) per tier-member index.
  */
-function cutMarginalTier(tier: ReconcileMarket[], budget: bigint, result: Map<number, bigint>): void {
+function cutMarginalTier(tier: ReconcileMarket[], budget: bigint): Map<number, bigint> {
+  const result = new Map<number, bigint>(tier.map(m => [m.index, 0n]));
+  const unserved = new Map<number, ReconcileMarket>(tier.map(m => [m.index, m]));
+  let pool = [...unserved.values()];
   let remaining = budget;
-  const servedAtWish = new Set<number>();
-  while (remaining > 0n) {
-    let pool = tier.filter(m => !servedAtWish.has(m.index));
-    let cuts: { m: ReconcileMarket; cut: bigint }[] = [];
-    while (pool.length > 0) {
-      const pooledSupply = pool.reduce((sum, m) => sum + m.totalSupplyAssets, 0n);
-      const pooledBorrow = pool.reduce((sum, m) => sum + m.totalBorrowAssets, 0n);
-      if (pooledBorrow === 0n) {
-        // No borrows in the pool: utilization is 0 whatever we withdraw, so the
-        // common-util formula degenerates — serve the wishes in order instead.
-        for (const m of pool) {
-          const serve = -m.delta < remaining ? m.delta : -remaining;
-          result.set(m.index, serve);
-          remaining += serve;
-        }
-        return;
+
+  while (pool.length > 0 && remaining > 0n) {
+    const pooledSupply = pool.reduce((sum, m) => sum + m.totalSupplyAssets, 0n);
+    const pooledBorrow = pool.reduce((sum, m) => sum + m.totalBorrowAssets, 0n);
+    if (pooledBorrow === 0n) {
+      // No borrows in the pool: utilization is 0 whatever we withdraw, so the
+      // common-util formula degenerates — serve the wishes in order instead.
+      for (const m of pool) {
+        const serve = -m.delta < remaining ? m.delta : -remaining;
+        result.set(m.index, serve);
+        remaining += serve;
       }
-      cuts = pool.map(m => ({
-        m,
-        cut: (m.totalBorrowAssets * (pooledSupply - remaining)) / pooledBorrow - m.totalSupplyAssets,
-      }));
-      const cuttable = cuts.filter(c => c.cut < 0n);
-      if (cuttable.length === cuts.length) break;
-      pool = cuttable.map(c => c.m);
+      return result;
     }
-    if (pool.length === 0) return;
+
+    const cuts = pool.map(m => ({
+      m,
+      cut: (m.totalBorrowAssets * (pooledSupply - remaining)) / pooledBorrow - m.totalSupplyAssets,
+    }));
+    const cuttable = cuts.filter(c => c.cut < 0n);
+    if (cuttable.length < cuts.length) {
+      pool = cuttable.map(c => c.m);
+      continue;
+    }
 
     const wishBound = cuts.filter(c => c.cut < c.m.delta);
-    if (wishBound.length === 0) {
-      for (const c of cuts) result.set(c.m.index, c.cut);
-      return;
+    if (wishBound.length > 0) {
+      for (const c of wishBound) {
+        result.set(c.m.index, c.m.delta);
+        remaining += c.m.delta;
+        unserved.delete(c.m.index);
+      }
+      pool = [...unserved.values()];
+      continue;
     }
-    for (const c of wishBound) {
-      result.set(c.m.index, c.m.delta);
-      remaining += c.m.delta;
-      servedAtWish.add(c.m.index);
-    }
+
+    for (const c of cuts) result.set(c.m.index, c.cut);
+    return result;
   }
+  return result;
 }
 
 /**
@@ -254,28 +259,27 @@ export function reconcileToVaultLimits(args: {
   const floor = (totalAssets * BigInt(sleeveFloorBps)) / 10000n;
 
   const legs: ReconciledLeg[] = markets.map(m => ({ index: m.index, delta: m.delta }));
-  const legByIndex = new Map(legs.map(l => [l.index, l]));
 
   if (sleeveAfter > cap) {
     const budget = cap - sleeveUsds + withdrawalTotal;
     const fills = waterfillDeposits(deposits, budget < 0n ? 0n : budget);
-    for (const m of deposits) {
-      const leg = legByIndex.get(m.index)!;
-      leg.delta = fills.get(m.index)!;
-      if (leg.delta < m.delta) {
-        leg.note = `deposit cut from ${fmtUsds(m.delta)} by the ${sleeveCapBps} bps sleeve cap (waterfilled)`;
+    markets.forEach((m, i) => {
+      if (m.delta <= 0n) return;
+      legs[i].delta = fills.get(m.index)!;
+      if (legs[i].delta < m.delta) {
+        legs[i].note = `deposit cut from ${fmtUsds(m.delta)} by the ${sleeveCapBps} bps sleeve cap (waterfilled)`;
       }
-    }
+    });
   } else if (sleeveAfter < floor) {
     const budget = sleeveUsds - floor + depositTotal;
     const cuts = cutWithdrawalsByTiers(withdrawals, budget < 0n ? 0n : budget);
-    for (const m of withdrawals) {
-      const leg = legByIndex.get(m.index)!;
-      leg.delta = cuts.get(m.index)!;
-      if (leg.delta > m.delta) {
-        leg.note = `withdrawal cut from ${fmtUsds(-m.delta)} by the ${sleeveFloorBps} bps sleeve floor`;
+    markets.forEach((m, i) => {
+      if (m.delta >= 0n) return;
+      legs[i].delta = cuts.get(m.index)!;
+      if (legs[i].delta > m.delta) {
+        legs[i].note = `withdrawal cut from ${fmtUsds(-m.delta)} by the ${sleeveFloorBps} bps sleeve floor`;
       }
-    }
+    });
   }
 
   for (const leg of legs) {

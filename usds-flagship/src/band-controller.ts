@@ -152,6 +152,8 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
   const ssrT = ssrApy + marginBps / 10000;
   const toleranceApy = cfg.ssrTToleranceBps / 10000;
   const satApy = SAT_APY_FACTOR * m.anchorApy;
+  const ssrTDesc =
+    `SSR ${fmtPct(ssrApy)} + ${marginBps} bps${m.ssrTMarginBps !== undefined ? ' (per-market override)' : ''}`;
 
   const band = pickBand(satApy, ssrT, toleranceApy);
   if (band === 'HOLD') {
@@ -161,8 +163,7 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
       reasons: [
         `satApy ${fmtPct(satApy)} (0.9 x anchor ${fmtPct(m.anchorApy)}) inside zone ` +
         `[${fmtPct(ssrT - toleranceApy)}, ${fmtPct(ssrT + toleranceApy)}] ` +
-        `(SSR_t ${fmtPct(ssrT)} = SSR ${fmtPct(ssrApy)} + ${marginBps} bps` +
-        `${m.ssrTMarginBps !== undefined ? ', per-market override' : ''}) -> hold`,
+        `(SSR_t ${fmtPct(ssrT)} = ${ssrTDesc}) -> hold`,
       ],
     };
   }
@@ -170,8 +171,7 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
   const rule = BAND_RULE[band];
   const reasons: string[] = [
     `satApy ${fmtPct(satApy)} (0.9 x anchor ${fmtPct(m.anchorApy)}) vs SSR_t ${fmtPct(ssrT)} ` +
-    `+- ${fmtPct(toleranceApy)} (SSR ${fmtPct(ssrApy)} + ${marginBps} bps` +
-    `${m.ssrTMarginBps !== undefined ? ', per-market override' : ''}) -> band ${band} bps`,
+    `+- ${fmtPct(toleranceApy)} (${ssrTDesc}) -> band ${band} bps`,
   ];
 
   // Invert the band into an absolute vault target. ceil keeps the resulting
