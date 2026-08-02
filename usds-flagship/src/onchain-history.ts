@@ -1,8 +1,8 @@
 /**
  * On-chain action history for the band-steering controller.
  *
- * The band controller's direction-change cooldown (24h) and the SOUNDING feed
- * cooldown both need to know when the bot last allocated to / deallocated from
+ * The band controller's direction-change cooldown (24h) needs to know when the
+ * bot last allocated to / deallocated from
  * each market. Rather than persisting local state between cron runs (fragile on
  * Railway), we reconstruct it from Morpho Blue's own event log: every vault
  * allocation surfaces as a `Supply` event and every deallocation as a `Withdraw`

@@ -54,9 +54,9 @@ export interface AllocationInput {
   // perMarketAssets[] entry. Sweep semantics for market i are
   //   sweepByIndex?.[i] ?? (targetPerMarketBpsByIndex[i] === 0)
   // i.e. when omitted (or an entry is undefined) the legacy rule applies: a target-0
-  // market is a retired market and is swept. Bands mode supplies this so sweeps are
-  // controlled by the band decisions (RETIRED / maturity winddown) rather than inferred
-  // from bps targets, which carry no meaning there.
+  // market is a retired market and is swept. Bands mode supplies an explicit all-false
+  // vector — it never sweeps (RETIRED markets are left untouched), and its bps targets
+  // carry no meaning, so the legacy inference must not run.
   sweepByIndex?: boolean[];
 }
 
