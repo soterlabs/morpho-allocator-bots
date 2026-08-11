@@ -10,6 +10,7 @@
     "dev": "tsx src/allocator.ts",
     "allocate": "tsx src/allocator.ts",
     "optimize": "tsx src/optimize.ts",
+    "fork-sim": "tsx src/fork-sim.ts",
     "test": "vitest run"
   },
   "dependencies": {
