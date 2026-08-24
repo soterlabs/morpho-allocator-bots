@@ -20,13 +20,25 @@ market at its band: `targetSupplyTotal = ceil(borrow × 10000 / bandUtilBps)`.
 The band also becomes that market's dynamic `maxUtilizationBps`, so the
 existing withdrawal clamps land drains exactly on band.
 
+Two things sit outside the band ladder, both **priority** wishes that
+reconciliation serves before the ordinary ones. At most one market is
+**PRIMARY** (PT-sUSDS today): it has no band and is always asked to fill up to
+its cap — a **priority deposit**, served before every other deposit. And every
+non-RETIRED market carries an env **cap** (`CAP_<MARKET>_USDS` /
+`CAP_<MARKET>_BPS`); a position above it becomes a **priority withdrawal**
+back to the cap that bypasses every steering gate. Each market emits at most
+one wish per cycle, chosen in this order: priority withdrawal (cap breach) →
+priority deposit (PRIMARY fill) → band steering.
+
 ## Band selection (per STEERED market)
 
 `satAPY = 0.9 × anchorApy` (the supply rate at the IRM's 90% target; fee = 0,
 documented approximation). `SSR_t = SSR + SSR_T_MARGIN_BPS`, satisfaction zone
 `SSR_t ± SSR_T_TOLERANCE_BPS`. Every threshold derives from SSR_t, so a
 governance SSR change moves the whole ladder automatically. At SSR 3.52%
-(margin/tolerance 25 bps): SSR_t = 3.77%, zone [3.52%, 4.02%].
+(margin 0, tolerance 25 bps): SSR_t = 3.52%, zone [3.27%, 3.77%] — symmetric
+around SSR, a rate slightly under SSR is accepted for more competitive borrow
+rates.
 
 | satAPY | band (util held) | rule |
 |---|---|---|
@@ -37,56 +49,130 @@ governance SSR change moves the whole ladder automatically. At SSR 3.52%
 | `[1/12 × SSR_t, 1/3 × SSR_t)` | **9400** (94%) | `R-BAND94` |
 | below `1/12 × SSR_t` | **9500** (95%) | `R-BAND95` |
 
-## Gates (in order, per market)
+## Gates
 
-Each gate converts the computed delta into a hold carrying its rule:
+Every deposit/withdrawal wish — a band target or the PRIMARY fill — is sized
+by the same steps (`sizeWish` in `band-controller.ts`), whatever chose its
+target:
+
+- **cap bound**: the target is never negative, and a grow stops at
+  `effectiveCap` (above it the allocate would revert). The bound never turns
+  a grow into a drain — a position already above the ceiling stays put; only
+  a breach of the env cap drains on cap grounds.
+- **min action**: `|delta| < $10k` (`MIN_BAND_ACTION_USDS`) → `R-MINACTION`
+- **direction cooldown**: grow within 24 h of a deallocate, or drain within
+  24 h of an allocate (from on-chain Supply/Withdraw events,
+  `onBehalf = adapter`); same-direction moves are not limited → `R-COOLDOWN`
+- **step caps**: a surviving grow is clamped to `MAX_ALLOCATE_USDS`, a drain
+  to `MAX_DEALLOCATE_USDS`; a larger move spreads over subsequent cycles (the
+  rule is unchanged, the clamp is recorded in the reasons).
+
+Each gate converts the computed delta into a hold carrying its rule.
+Steering adds two gates of its own around the shared ones, so the order per
+STEERED market is:
 
 1. **util deadband**: `|utilBps − bandUtilBps| ≤ 50 bps` → `R-DEADBAND`
-2. **min action**: `|delta| < $100k` (`MIN_BAND_ACTION_USDS`) → `R-MINACTION`
-3. **direction cooldown**: grow within 24 h of a deallocate, or drain within
-   24 h of an allocate (from on-chain Supply/Withdraw events,
-   `onBehalf = adapter`); same-direction moves are not limited → `R-COOLDOWN`
-4. **monopolist share**: drain while vault share of market supply < 80% →
+2. min action, direction cooldown (shared)
+3. **monopolist share**: drain while vault share of market supply < 80% →
    `R-SHARE` (we are not the dominant supplier; draining cannot move util —
    go neutral; grows still allowed)
+4. step caps (shared)
 
-A surviving delta is clamped to the per-cycle step caps `MAX_ALLOCATE_USDS` /
-`MAX_DEALLOCATE_USDS`; a larger move spreads over subsequent cycles.
+A priority withdrawal skips all of this — see below.
+
+## Market caps
+
+Same semantics as `bps` mode: caps live off-chain in env (the bot never
+reads the on-chain absolute cap), and the on-chain relative cap is read only
+to clamp allocations at execution. A market may carry an optional amount cap
+(`CAP_<MARKET>_USDS`, whole USDS — PT-sUSDS falls back to
+`PT_SUSDS_ABSOLUTE_CAP_USDS`, its bps-mode cap) and/or an optional share cap
+(`CAP_<MARKET>_BPS`, bps of totalAssets). On the cycle's pinned snapshot:
+
+- `marketCap` = the smaller of the caps set — the breach line; undefined for
+  a market with no env cap, which then never emits a priority withdrawal.
+- `effectiveCap = min(on-chain relative cap − 1 bps headroom, marketCap)` —
+  the deposit ceiling; band targets and the PRIMARY fill clamp to it (just
+  the on-chain bound when there is no env cap).
+
+The on-chain relative cap only clamps deposits; it never triggers a drain.
+
+## Priority withdrawal (cap breach)
+
+Evaluated before any steering, for STEERED and PRIMARY markets. A position
+above `marketCap` by at least `MIN_PRIORITY_WITHDRAWAL_USDS` ($50k) — or by
+at least the 100 USDS dust floor when `marketCap` is 0, which drains the
+market down to that floor — becomes a **priority withdrawal** back to the cap
+(`R-PRIORITY-WITHDRAWAL`). A slice the pool's liquidity leaves under that
+threshold is held rather than traded (same rule, no priority flag). A breach
+is a policy violation, not a rate signal, so it skips every steering gate: no
+band, no deadband, no direction cooldown, no monopolist share. Only two
+things bound it: the pool's withdrawable liquidity (`supply − borrow − 5%
+reserve`, the executor's own `LIQUIDITY_RESERVE_PERCENT` rule, so the plan
+never promises liquidity the executor would refuse) and `MAX_DEALLOCATE_USDS`.
+With no withdrawable liquidity the market holds and retries next cycle. The
+withdrawal replaces the market's steering wish — one wish per market per
+cycle.
+
+RETIRED markets stay untouched even above their cap (`R-RETIRED`).
+
+## Priority deposit (PRIMARY market)
+
+At most one market (PT-sUSDS today, `MODE_PTSUSDS=PRIMARY`). No band and no
+rate input — satAPY plays no role. Its wish is always the whole gap up to
+`effectiveCap` as a **priority deposit** (`R-PRIORITY-DEPOSIT`), which
+reconciliation serves before any other deposit. The shared sizing still
+applies: a gap below `MIN_BAND_ACTION_USDS` ($10k) holds (`R-MINACTION`), a
+grow within 24 h of a deallocate holds (`R-COOLDOWN`), and the grow is
+clamped to `MAX_ALLOCATE_USDS`. At or above the cap the market holds
+(`R-HOLD`); it withdraws only through the priority-withdrawal rule.
 
 ## Vault-level reconciliation (`reconcile.ts`)
 
 The per-market wishes are reconciled against the sleeve limits before the
 batch is built. The allocated sleeve must end the batch inside **[15%, 20%]**
-of totalAssets; both limits are hard and are checked on the post-batch state:
+of totalAssets; both limits are hard and are checked on the post-batch state.
+On each side the priority wishes are served first, off the top of the budget;
+the ordinary wishes share what is left:
 
-- **deposits exceed the 20% cap** → waterfilling: the deposit budget (cap
-  headroom + same-batch withdrawals) fills the highest-earning markets first,
-  down to a common spot supply APY — no dollar of the budget could be moved
-  to a better market.
-- **withdrawals break the 15% floor** → cut in band tiers from the deepest
-  band down: whole tiers are served fully; the tier the budget (floor
-  headroom + same-batch deposits) cannot cover lands on one common
-  utilization `u* = pooledBorrow / (pooledSupply − budget)`, so every market
-  in it heats at the same tempo; shallower tiers wait for the next cycle.
+- **deposits exceed the 20% cap** → the PRIMARY deposit is carved off the
+  budget (cap headroom + same-batch withdrawals) first, up to the whole
+  budget and never ranked by its spot rate; the remainder is waterfilled:
+  the highest-earning markets fill first, down to a common spot supply APY —
+  no dollar of the remaining budget could be moved to a better market.
+- **withdrawals break the 15% floor** → priority withdrawals (cap breaches)
+  are served first — the PRIMARY market's ahead of the others, then the
+  largest first — each up to what is left of the budget (floor headroom +
+  same-batch deposits); the band wishes then share the remainder in tiers
+  from the deepest band down: whole tiers are served fully; the tier the
+  budget cannot cover lands on one common utilization
+  `u* = pooledBorrow / (pooledSupply − budget)`, so every market in it heats
+  at the same tempo; shallower tiers wait for the next cycle.
 
-Legs below `MIN_BAND_ACTION_USDS` are then dropped; an empty batch does not
-fly.
+Legs below their drop threshold are then removed: `MIN_BAND_ACTION_USDS`
+($10k) for a steering leg or a priority deposit,
+`MIN_PRIORITY_WITHDRAWAL_USDS` ($50k) for a priority withdrawal — except that
+a zero-cap withdrawal smaller than $50k passes as a whole (the controller
+already sized it above the 100 USDS dust floor, and it bypasses the
+executor's dust floor so the market ends holding nothing) while a floor cut
+leaving only part of it is dropped. An empty batch does not fly.
 
 ## Market modes
 
 | mode | behavior |
 |---|---|
-| `STEERED` | the band ladder above |
-| `RETIRED` | the bot never touches the market |
+| `STEERED` | the band ladder above; priority withdrawal above its cap |
+| `PRIMARY` | no band: always asks to fill up to its cap as a priority deposit, served before every other deposit; priority withdrawal above its cap. At most one market (startup throw otherwise); `bps` mode rejects it |
+| `RETIRED` | the bot never touches the market — not even above its cap; caps optional |
 | `SOUNDING` | recognized name; configuring it refuses to start |
 
-| market (index) | mode env | default |
-|---|---|---|
-| stUSDS/USDS (0) | `MODE_STUSDS` | `RETIRED` |
-| cbBTC/USDS (1) | `MODE_CBBTC` | `STEERED` |
-| wstETH/USDS (2) | `MODE_WSTETH` | `STEERED` |
-| PT-sUSDS/USDS (3) | `MODE_PTSUSDS` | `STEERED` |
-| WETH/USDS (4) | `MODE_WETH` | `STEERED` |
+| market (index) | mode env | code default (env unset) | `.env.example` |
+|---|---|---|---|
+| stUSDS/USDS (0) | `MODE_STUSDS` | `RETIRED` | `RETIRED` |
+| cbBTC/USDS (1) | `MODE_CBBTC` | `STEERED` | `STEERED` |
+| wstETH/USDS (2) | `MODE_WSTETH` | `STEERED` | `STEERED` |
+| PT-sUSDS/USDS (3) | `MODE_PTSUSDS` | `STEERED` | `PRIMARY` |
+| WETH/USDS (4) | `MODE_WETH` | `STEERED` | `STEERED` |
 
 ## Environment variables (bands mode)
 
@@ -94,28 +180,32 @@ fly.
 |---|---|---|
 | `ALLOCATION_MODE` | **REQUIRED** | `bps` \| `bands`, no default. `bps` = static-target allocation decisions unchanged (incl. `validateTargetBpsSum`); fail-loud execution hardening is shared by both modes |
 | `BOT_PAUSED` | `false` | `true` → log `paused`, exit 0 |
-| `MAX_ALLOCATE_USDS` | **REQUIRED** (≥ min action) | per-market per-cycle grow step cap, whole USDS |
-| `MAX_DEALLOCATE_USDS` | **REQUIRED** (≥ min action) | per-market per-cycle drain step cap (in `bps` mode stays optional, `0` = no cap) |
-| `SSR_T_MARGIN_BPS` | `25` | global SSR_t margin for STEERED markets |
-| `SSR_T_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global; validated ≥ tolerance |
+| `MAX_ALLOCATE_USDS` | **REQUIRED** (≥ `MIN_BAND_ACTION_USDS`) | per-market per-cycle grow step cap, whole USDS |
+| `MAX_DEALLOCATE_USDS` | **REQUIRED** (≥ `MIN_BAND_ACTION_USDS` and ≥ `MIN_PRIORITY_WITHDRAWAL_USDS`) | per-market per-cycle drain step cap (in `bps` mode stays optional, `0` = no cap) |
+| `CAP_<MARKET>_USDS` | unset (PT-sUSDS: `PT_SUSDS_ABSOLUTE_CAP_USDS`) | optional cap amount, whole USDS (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); `0` = hold nothing, drain everything |
+| `CAP_<MARKET>_BPS` | unset | optional cap as bps of totalAssets; `marketCap` = the smaller of the caps set; a market with none is bounded by the on-chain relative cap only (as in `bps` mode) and never emits a priority withdrawal |
+| `MIN_PRIORITY_WITHDRAWAL_USDS` | `50000` | smallest priority withdrawal, whole USDS; a smaller breach waits (a zero cap drains from the 100 USDS dust floor instead) |
+| `SSR_T_MARGIN_BPS` | `0` | global SSR_t margin for STEERED markets |
+| `SSR_T_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
 | `SSR_T_TOLERANCE_BPS` | `25` | zone half-width; validated ≤ margin |
 | `UTIL_DEADBAND_BPS` | `50` | |
-| `MIN_BAND_ACTION_USDS` | `100000` | whole USDS |
+| `MIN_BAND_ACTION_USDS` | `10000` | whole USDS; smallest steering leg or priority deposit |
 | `SLEEVE_FLOOR_BPS` | `1500` | validated < 2000 |
 | `DIRECTION_COOLDOWN_HOURS` | `24` | |
 | `MONOPOLIST_SHARE_BPS` | `8000` | |
 | `SSR_MIN_APY_BPS` | `100` | SSR outside [min, max] → abort the cycle, never default |
 | `SSR_MAX_APY_BPS` | `1500` | |
-| `MODE_STUSDS` | `RETIRED` | enum-validated |
+| `MODE_STUSDS` | `RETIRED` | `STEERED` \| `PRIMARY` \| `RETIRED`, enum-validated (`SOUNDING` refuses to start); at most one `PRIMARY` |
 | `MODE_CBBTC` | `STEERED` | |
 | `MODE_WSTETH` | `STEERED` | |
 | `MODE_WETH` | `STEERED` | |
-| `MODE_PTSUSDS` | `STEERED` | |
+| `MODE_PTSUSDS` | `STEERED` | `.env.example` sets `PRIMARY` |
 | `DRY_RUN` | `false` | `true` = compute + trace, execute nothing (shadow mode) |
 
 Existing allocator envs (`RPC_URL`, `PRIVATE_KEY`, `SAFE_ADDRESS`,
-`VAULT_ADDRESS`, `ADAPTER_ADDRESS`, `ORACLE_*`, `LLTV_*`,
-`PT_SUSDS_ABSOLUTE_CAP_USDS`) are unchanged — see `usds-flagship/README.md`.
+`VAULT_ADDRESS`, `ADAPTER_ADDRESS`, `ORACLE_*`, `LLTV_*`) are unchanged —
+see `usds-flagship/README.md`. `PT_SUSDS_ABSOLUTE_CAP_USDS` is `bps`-mode /
+optimizer only; in bands mode PT-sUSDS is bounded by `CAP_PTSUSDS_*`.
 
 ## Pre-flight safety checks
 
@@ -143,12 +233,14 @@ and the **log-only A/B borrower-reaction bracket** — the anchor projected
 | rule | meaning |
 |---|---|
 | `R-BAND90` … `R-BAND95` | held at that utilization band |
-| `R-HOLD` | satAPY inside the zone → no action |
+| `R-HOLD` | satAPY inside the zone → no action; also a PRIMARY market at/above its cap |
 | `R-DEADBAND` | util within 50 bps of band → hold |
-| `R-MINACTION` | \|delta\| < $100k → hold |
-| `R-COOLDOWN` | direction change within 24 h cooldown → hold |
+| `R-MINACTION` | \|delta\| < $10k → hold (STEERED and PRIMARY) |
+| `R-COOLDOWN` | direction change within 24 h cooldown → hold (STEERED; PRIMARY grow after a deallocate) |
 | `R-SHARE` | vault share < 80% → drain suppressed (neutral; grows allowed) |
-| `R-RETIRED` | mode RETIRED: never touched |
+| `R-PRIORITY-DEPOSIT` | mode PRIMARY: priority deposit up to effectiveCap |
+| `R-PRIORITY-WITHDRAWAL` | position above marketCap by ≥ $50k (≥ the 100 USDS dust floor at cap 0): priority withdrawal to the cap, bounded by withdrawable liquidity and `MAX_DEALLOCATE_USDS`; hold (same rule, no priority flag) when the withdrawable slice is under the threshold |
+| `R-RETIRED` | mode RETIRED: never touched, even above its cap |
 
 ## Rollout
 
@@ -173,3 +265,13 @@ and the **log-only A/B borrower-reaction bracket** — the anchor projected
 - **`anchor-sim` segmentation**: the IRM's `wExp` is a chunked Taylor
   approximation, so projected drift depends on how callers segment the
   utilization path. Projections are indicative, not bit-exact forecasts.
+- **RETIRED is never drained**, even above its cap. Draining a retired
+  market means setting it to `STEERED` with `CAP_<MARKET>_USDS=0` /
+  `CAP_<MARKET>_BPS=0`.
+- **The 1 bps sliver is not a breach**: `effectiveCap` sits 1 bps under the
+  on-chain relative cap, so a position that accrues past it after a fill is
+  not drained — it does not exceed `marketCap` when the on-chain cap binds,
+  and it is far below `MIN_PRIORITY_WITHDRAWAL_USDS` when the env cap binds.
+- **PRIMARY captures budget only** — it never drains other markets to fund
+  itself. With a full sleeve its fill comes only from same-batch withdrawals
+  (band drains, priority withdrawals) and TVL growth, one step cap per cycle.

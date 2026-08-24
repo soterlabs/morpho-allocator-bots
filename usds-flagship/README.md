@@ -51,9 +51,11 @@ The strategy above is the `bps` mode of a required `ALLOCATION_MODE` env
 targets are replaced by **satAPY band steering**: each STEERED market is held
 at 90 / 92 / 93 / 94 / 95% utilization depending on where its
 satAPY (= 0.9 x anchor) sits versus thresholds derived from
-SSR_t = SSR + 25 bps (SSR read on-chain from `sUSDS.ssr()`), letting the
-Adaptive Curve IRM drift borrow rates toward the SSR_t +- 25 bps zone. Inside
-the zone the market holds with no action.
+SSR_t = SSR + `SSR_T_MARGIN_BPS` (0 by default; SSR read on-chain from
+`sUSDS.ssr()`), letting the Adaptive Curve IRM drift borrow rates toward the
+SSR_t +- 25 bps zone — symmetric around SSR, so a rate slightly under SSR is
+accepted for more competitive borrow rates. Inside the zone the market holds
+with no action.
 
 | band | when (satAPY) |
 |---|---|
@@ -64,23 +66,52 @@ the zone the market holds with no action.
 | 94% | [1/12 x SSR_t, 1/3 x SSR_t) |
 | 95% | below 1/12 x SSR_t |
 
-Per-market gates: 50 bps util deadband, $100k min action, 24 h
+Per-market gates: 50 bps util deadband, $10k min action, 24 h
 direction-change cooldown (reconstructed from on-chain events), 80%
 monopolist share gate, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
-(REQUIRED in bands mode), SSR sanity bounds [1%, 15%]. The per-market wishes
-are then reconciled against the vault-level sleeve limits (`reconcile.ts`):
-the sleeve ends every batch inside [15%, 20%] of totalAssets — deposits over
-the cap are waterfilled to a common spot rate, withdrawals under the floor
-are cut in band tiers from the deepest band (the marginal tier lands on one
-common utilization), and legs below $100k are dropped.
+(REQUIRED in bands mode), SSR sanity bounds [1%, 15%].
 
-Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH, WETH, PT-sUSDS) |
-`RETIRED` (stUSDS — never touched). Cadence `*/20 * * * *`;
+**Market caps.** Same semantics as `bps` mode: the bot keeps caps off-chain
+in env and reads the on-chain relative cap only to clamp allocations at
+execution. A market may carry an optional amount cap (`CAP_<MARKET>_USDS`,
+falling back to `PT_SUSDS_ABSOLUTE_CAP_USDS` for PT-sUSDS) and/or a share cap
+(`CAP_<MARKET>_BPS`); its cap is the smaller of those set, on the cycle's
+pinned snapshot, and deposits are additionally clamped by the on-chain
+relative cap (with the 1 bps headroom). A market with no env cap is bounded
+by the on-chain cap alone and never emits a priority withdrawal. The on-chain
+cap never triggers a drain — only the env cap does: a STEERED or PRIMARY position above
+its cap by at least `MIN_PRIORITY_WITHDRAWAL_USDS` ($50k; the 100 USDS dust
+floor when the cap is 0, which drains the market down to it) becomes a
+**priority withdrawal** back to the cap. No band, no deadband, no 24 h
+cooldown, no monopolist gate — only the pool's withdrawable liquidity
+(supply − borrow − 5% reserve) and `MAX_DEALLOCATE_USDS` bound it, and it
+replaces the market's steering wish (one wish per market per cycle). RETIRED
+markets are never drained, even above their cap.
+
+**PRIMARY market** (at most one; PT-sUSDS today). No band and no rate input:
+its wish is always "fill to the cap" as a **priority deposit** ($10k min
+action, grow cooldown and `MAX_ALLOCATE_USDS` still apply); at or above the
+cap it holds, and it withdraws only through the priority-withdrawal rule.
+
+The per-market wishes are then reconciled against the vault-level sleeve
+limits (`reconcile.ts`): the sleeve ends every batch inside [15%, 20%] of
+totalAssets. Deposits over the cap: the priority deposit is carved off the
+budget first, the remainder is waterfilled to a common spot rate.
+Withdrawals under the floor: priority withdrawals are served first (the
+PRIMARY market's first, then the largest first), then band tiers from the
+deepest band (the marginal tier lands on one common utilization). Legs below
+their threshold are dropped — $10k for a steering leg or a priority deposit,
+$50k for a priority withdrawal (a zero-cap withdrawal smaller than that
+passes only as a whole).
+
+Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH, WETH) | `PRIMARY`
+(PT-sUSDS — filled to its cap first) | `RETIRED` (stUSDS — never touched).
+Cadence `0 * * * *` (hourly);
 `BOT_PAUSED=true` is the kill switch; `bps` mode remains the
 **decision-identical** rollback — allocation decisions are unchanged from the
 legacy behavior, while both modes share the hardened fail-loud execution path
 (required `RPC_URL`, non-zero exit on revert/timeout, pending-nonce guard,
-20-minute cadence). Full parameter/env tables, decision-trace format, and
+hourly cadence). Full parameter/env tables, decision-trace format, and
 rule-ID glossary: [`../docs/band-steering.md`](../docs/band-steering.md).
 
 ## Allocation optimizer (read-only)

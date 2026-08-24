@@ -5,19 +5,25 @@
  * into the final transaction legs by enforcing the vault-level sleeve limits: the
  * allocated sleeve (sum of market positions) must end the batch inside
  * [sleeveFloorBps, sleeveCapBps] of totalAssets. Both limits are hard and are checked
- * on the post-batch state; at most one side can be short of budget:
+ * on the post-batch state; at most one side can be short of budget. On each side the
+ * PRIORITY wishes (the PRIMARY market's deposit, cap-breach withdrawals) are served
+ * first, off the top of the budget; the ordinary wishes share what is left:
  *
- *   - deposits exceed the cap  -> waterfilling: fill the highest-earning markets first,
- *     down to a common spot supply APY level, so no dollar of the budget could be
- *     moved to a better market. The deposit budget credits same-batch withdrawals.
+ *   - deposits exceed the cap  -> the priority deposit is carved out first, then
+ *     waterfilling: fill the highest-earning markets down to a common spot supply APY
+ *     level, so no dollar of the remaining budget could be moved to a better market.
+ *     The deposit budget credits same-batch withdrawals.
  *
- *   - withdrawals break the floor -> cut in band tiers from the deepest band down:
- *     whole tiers are served fully; the tier the budget cannot cover lands on one
- *     common utilization u* = pooledBorrow / (pooledSupply - budget), so every market
- *     in it heats at the same tempo; shallower tiers wait. The withdrawal budget
- *     credits same-batch deposits.
+ *   - withdrawals break the floor -> priority withdrawals are served first (the
+ *     PRIMARY market's ahead of the others, then the largest first), then the band
+ *     wishes are cut in tiers from the deepest band down: whole tiers are served
+ *     fully; the tier the budget cannot cover lands on one common utilization
+ *     u* = pooledBorrow / (pooledSupply - budget), so every market in it heats at
+ *     the same tempo; shallower tiers wait. The withdrawal budget credits same-batch
+ *     deposits.
  *
- * Legs smaller than minActionUsds are dropped at the end. PURE: no RPC, no env.
+ * Legs smaller than their drop threshold (minActionUsds, or the market's own
+ * minActionUsds override) are dropped at the end. PURE: no RPC, no env.
  * All amounts are 18-dec USDS; rates are APY fractions (0.0352 = 3.52%).
  */
 
@@ -41,8 +47,17 @@ export interface ReconcileMarket {
   name: string;
   /** Wished vault delta from the band decision: > 0 deposit, < 0 withdrawal, 0 no action. */
   delta: bigint;
-  /** Band behind a non-zero wish (tier key for withdrawal cuts). */
+  /**
+   * Served before the ordinary wishes on its side: a PRIMARY deposit (carved off the
+   * budget before waterfilling) or a cap-breach withdrawal (paid before the band tiers).
+   */
+  priority: boolean;
+  /** The PRIMARY market: its priority withdrawal is paid ahead of the other ones. */
+  primary: boolean;
+  /** Band behind a non-priority withdrawal (tier key for the floor cut). */
   bandUtilBps?: number;
+  /** Drop threshold for this market's final leg; defaults to the global minActionUsds. */
+  minActionUsds?: bigint;
   totalSupplyAssets: bigint;
   totalBorrowAssets: bigint;
   anchorApy: number;
@@ -111,6 +126,7 @@ function waterfillDeposits(deposits: ReconcileMarket[], budget: bigint): Map<num
   const totalAt = (fills: Map<number, bigint>): bigint =>
     [...fills.values()].reduce((sum, x) => sum + x, 0n);
 
+  if (deposits.length === 0) return new Map();
   if (budget <= 0n) return new Map(deposits.map(m => [m.index, 0n]));
   const wishTotal = deposits.reduce((sum, m) => sum + m.delta, 0n);
   if (wishTotal <= budget) return new Map(deposits.map(m => [m.index, m.delta]));
@@ -135,18 +151,69 @@ function waterfillDeposits(deposits: ReconcileMarket[], budget: bigint): Map<num
 }
 
 /**
- * Cut withdrawal wishes to `budget` in band tiers from the deepest band down.
- * Tiers the budget covers pass whole; the marginal tier is pooled as one market and
- * every member is withdrawn to the common utilization
+ * Cut deposit wishes to `budget`: the priority deposit (the PRIMARY market) is served
+ * first, up to the whole budget, and never ranked by its spot rate — it is the
+ * vault's declared destination, not a yield pick. The rest of the budget is
+ * waterfilled across the ordinary deposits. Returns the final deposit per market
+ * index; the sum never exceeds the budget.
+ */
+function cutDeposits(deposits: ReconcileMarket[], budget: bigint): Map<number, bigint> {
+  const priority = deposits.filter(m => m.priority);
+  if (priority.length > 1) {
+    throw new Error(
+      `${priority.map(m => m.name).join(', ')} all carry priority deposits — the carve is defined for one market`
+    );
+  }
+  const result = new Map<number, bigint>();
+  let remaining = budget < 0n ? 0n : budget;
+  for (const m of priority) {
+    const fill = m.delta < remaining ? m.delta : remaining;
+    result.set(m.index, fill);
+    remaining -= fill;
+  }
+  for (const [index, fill] of waterfillDeposits(deposits.filter(m => !m.priority), remaining)) {
+    result.set(index, fill);
+  }
+  return result;
+}
+
+/** The part of a withdrawal wish (< 0) the remaining budget can pay, as a delta (<= 0). */
+function serveUpTo(wish: bigint, remaining: bigint): bigint {
+  return -wish < remaining ? wish : -remaining;
+}
+
+/**
+ * Order among priority withdrawals: the PRIMARY market first (so lowering its cap
+ * winds it down ahead of everything else), then the largest wish first — deltas are
+ * negative, so ascending delta is descending size.
+ */
+function primaryThenLargestFirst(a: ReconcileMarket, b: ReconcileMarket): number {
+  if (a.primary !== b.primary) return a.primary ? -1 : 1;
+  return a.delta < b.delta ? -1 : a.delta > b.delta ? 1 : 0;
+}
+
+/**
+ * Cut withdrawal wishes to `budget`: priority withdrawals (cap breaches) are served
+ * first — the PRIMARY market's ahead of the others, then the largest first — each
+ * up to what is left; the band wishes then share the remainder in tiers from the
+ * deepest band down. Tiers the budget covers pass whole; the marginal tier is
+ * pooled as one market and every member is withdrawn to the common utilization
  * u* = pooledBorrow / (pooledSupply - remainingBudget); tiers below it are dropped.
  * A cut never exceeds the original wish. Returns the final withdrawal (<= 0) per
  * market index.
  */
-function cutWithdrawalsByTiers(withdrawals: ReconcileMarket[], budget: bigint): Map<number, bigint> {
+function cutWithdrawals(withdrawals: ReconcileMarket[], budget: bigint): Map<number, bigint> {
   const result = new Map<number, bigint>(withdrawals.map(m => [m.index, 0n]));
+  let remaining = budget < 0n ? 0n : budget;
+
+  for (const m of withdrawals.filter(m => m.priority).sort(primaryThenLargestFirst)) {
+    const serve = serveUpTo(m.delta, remaining);
+    result.set(m.index, serve);
+    remaining += serve;
+  }
 
   const tiers = new Map<number, ReconcileMarket[]>();
-  for (const m of withdrawals) {
+  for (const m of withdrawals.filter(m => !m.priority)) {
     if (m.bandUtilBps === undefined) {
       throw new Error(`${m.name}: withdrawal wish without a band — cannot tier it for the floor cut`);
     }
@@ -155,7 +222,6 @@ function cutWithdrawalsByTiers(withdrawals: ReconcileMarket[], budget: bigint): 
     tiers.set(m.bandUtilBps, tier);
   }
 
-  let remaining = budget;
   for (const bandUtilBps of [...tiers.keys()].sort((a, b) => b - a)) {
     const tier = tiers.get(bandUtilBps)!;
     const tierTotal = tier.reduce((sum, m) => sum - m.delta, 0n);
@@ -199,7 +265,7 @@ function cutMarginalTier(tier: ReconcileMarket[], budget: bigint): Map<number, b
       // No borrows in the pool: utilization is 0 whatever we withdraw, so the
       // common-util formula degenerates — serve the wishes in order instead.
       for (const m of pool) {
-        const serve = -m.delta < remaining ? m.delta : -remaining;
+        const serve = serveUpTo(m.delta, remaining);
         result.set(m.index, serve);
         remaining += serve;
       }
@@ -235,8 +301,8 @@ function cutMarginalTier(tier: ReconcileMarket[], budget: bigint): Map<number, b
 
 /**
  * Reconcile the wish list against the vault-level sleeve limits and drop legs below
- * minActionUsds. Returns one leg per input market, in input order; a delta of 0 means
- * no transaction for that market this cycle.
+ * their threshold. Returns one leg per input market, in input order; a delta of 0
+ * means no transaction for that market this cycle.
  */
 export function reconcileToVaultLimits(args: {
   markets: ReconcileMarket[];
@@ -245,6 +311,7 @@ export function reconcileToVaultLimits(args: {
   totalAssets: bigint;
   sleeveFloorBps: number;
   sleeveCapBps: number;
+  /** Drop threshold for legs whose market sets no minActionUsds of its own. */
   minActionUsds: bigint;
 }): ReconciledLeg[] {
   const { markets, sleeveUsds, totalAssets, sleeveFloorBps, sleeveCapBps, minActionUsds } = args;
@@ -261,33 +328,35 @@ export function reconcileToVaultLimits(args: {
   const legs: ReconciledLeg[] = markets.map(m => ({ index: m.index, delta: m.delta }));
 
   if (sleeveAfter > cap) {
-    const budget = cap - sleeveUsds + withdrawalTotal;
-    const fills = waterfillDeposits(deposits, budget < 0n ? 0n : budget);
+    const fills = cutDeposits(deposits, cap - sleeveUsds + withdrawalTotal);
     markets.forEach((m, i) => {
       if (m.delta <= 0n) return;
       legs[i].delta = fills.get(m.index)!;
       if (legs[i].delta < m.delta) {
-        legs[i].note = `deposit cut from ${fmtUsds(m.delta)} by the ${sleeveCapBps} bps sleeve cap (waterfilled)`;
+        legs[i].note = `deposit cut from ${fmtUsds(m.delta)} by the ${sleeveCapBps} bps sleeve cap` +
+          (m.priority ? ' (priority, served first)' : ' (waterfilled)');
       }
     });
   } else if (sleeveAfter < floor) {
-    const budget = sleeveUsds - floor + depositTotal;
-    const cuts = cutWithdrawalsByTiers(withdrawals, budget < 0n ? 0n : budget);
+    const cuts = cutWithdrawals(withdrawals, sleeveUsds - floor + depositTotal);
     markets.forEach((m, i) => {
       if (m.delta >= 0n) return;
       legs[i].delta = cuts.get(m.index)!;
       if (legs[i].delta > m.delta) {
-        legs[i].note = `withdrawal cut from ${fmtUsds(-m.delta)} by the ${sleeveFloorBps} bps sleeve floor`;
+        legs[i].note = `withdrawal cut from ${fmtUsds(-m.delta)} by the ${sleeveFloorBps} bps sleeve floor` +
+          (m.priority ? ' (priority, served first)' : '');
       }
     });
   }
 
-  for (const leg of legs) {
+  markets.forEach((m, i) => {
+    const leg = legs[i];
+    const threshold = m.minActionUsds ?? minActionUsds;
     const size = leg.delta < 0n ? -leg.delta : leg.delta;
-    if (size > 0n && size < minActionUsds) {
+    if (size > 0n && size < threshold) {
       leg.delta = 0n;
-      leg.note = `leg ${fmtUsds(size)} below min action ${fmtUsds(minActionUsds)} — dropped`;
+      leg.note = `leg ${fmtUsds(size)} below min action ${fmtUsds(threshold)} — dropped`;
     }
-  }
+  });
   return legs;
 }

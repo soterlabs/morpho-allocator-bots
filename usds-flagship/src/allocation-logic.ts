@@ -21,6 +21,13 @@ export const CAP_HEADROOM_BPS = 1n;
  */
 export const LIQUIDITY_RESERVE_PERCENT = BigInt(process.env.LIQUIDITY_RESERVE_PERCENT ?? '5');
 
+/**
+ * Smallest position worth a transaction (100 USDS): the executor's dust floor for
+ * deallocations and sweeps, and the bands controller's floor for draining a zero-cap
+ * market — a residue under it is tolerated rather than chased with more Safe txs.
+ */
+export const DUST_FLOOR_USDS = 100n * 10n ** 18n;
+
 export interface AllocationAction {
   marketIndex: number;
   action: 'allocate' | 'deallocate';
@@ -463,6 +470,23 @@ export interface CappedAction {
 }
 
 /**
+ * Maximum amount withdrawable from a market under the flat supply-reserve cushion:
+ *   reserve = totalSupplyAssets * reservePercent / 100
+ *   max(0, (totalSupplyAssets - totalBorrowAssets) - reserve)
+ * Shared by the executor's liquidity cap and the bands controller's cap-breach
+ * sizing, so a planned drain is never larger than the executor will let through.
+ */
+export function maxWithdrawableWithReserve(
+  totalSupplyAssets: bigint,
+  totalBorrowAssets: bigint,
+  reservePercent: bigint,
+): bigint {
+  const liquidity = totalSupplyAssets > totalBorrowAssets ? totalSupplyAssets - totalBorrowAssets : 0n;
+  const reserve = totalSupplyAssets * reservePercent / 100n;
+  return liquidity > reserve ? liquidity - reserve : 0n;
+}
+
+/**
  * Cap deallocate amounts to available market liquidity, reserving a cushion
  * to avoid pushing utilization to 100%.
  *
@@ -498,10 +522,7 @@ export function capDeallocationsToLiquidity(
     //  - otherwise: reserve LIQUIDITY_RESERVE_PERCENT of totalSupply as a flat cushion.
     const maxWithdrawable = ml.maxUtilizationBps !== undefined
       ? maxWithdrawableForUtilization(ml.totalSupplyAssets, ml.totalBorrowAssets, ml.maxUtilizationBps)
-      : (() => {
-          const reserve = ml.totalSupplyAssets * LIQUIDITY_RESERVE_PERCENT / 100n;
-          return liquidity > reserve ? liquidity - reserve : 0n;
-        })();
+      : maxWithdrawableWithReserve(ml.totalSupplyAssets, ml.totalBorrowAssets, LIQUIDITY_RESERVE_PERCENT);
 
     if (maxWithdrawable === 0n) {
       return { marketIndex: a.marketIndex, amount: 0n, capped: false, skipped: true, availableLiquidity: liquidity };

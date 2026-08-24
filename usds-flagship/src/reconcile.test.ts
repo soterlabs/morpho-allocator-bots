@@ -10,6 +10,8 @@ function wish(overrides: Partial<ReconcileMarket> & { index: number }): Reconcil
   return {
     name: 'cbBTC/USDS',
     delta: 0n,
+    priority: false,
+    primary: false,
     bandUtilBps: 9300,
     totalSupplyAssets: parseEther('4200000'),
     totalBorrowAssets: parseEther('3720000'),
@@ -18,6 +20,10 @@ function wish(overrides: Partial<ReconcileMarket> & { index: number }): Reconcil
   };
 }
 
+/**
+ * The suite's global drop threshold is 100k so a floor/cap cut visibly lands a leg
+ * under it; the production value comes from BandConfig, not from reconciliation.
+ */
 function reconcile(markets: ReconcileMarket[], sleeveUsds: bigint) {
   return reconcileToVaultLimits({
     markets,
@@ -251,5 +257,323 @@ describe('withdrawals under the 15% floor (band tiers, deepest first)', () => {
     expect(legs[0].delta).toBe(0n);
     expect(legs[0].note).toBeUndefined();
     expect(legs[1].delta).toBe(-parseEther('150000'));
+  });
+});
+
+/**
+ * PT-sUSDS/USDS-like PRIMARY wish: 2.415M supply, 2.198M borrow, anchor 2.93% —
+ * spot ~3.5%, far under a heated bluechip market's spot, so waterfilling alone
+ * would never pick it.
+ */
+function primaryWish(overrides: Partial<ReconcileMarket> & { index: number }): ReconcileMarket {
+  return wish({
+    name: 'PT-sUSDS/USDS',
+    priority: true,
+    primary: true,
+    bandUtilBps: undefined,
+    totalSupplyAssets: parseEther('2415000'),
+    totalBorrowAssets: parseEther('2198000'),
+    anchorApy: 0.0293,
+    ...overrides,
+  });
+}
+
+/** Heated cbBTC/USDS: pinned at 100% util with a 4.6% anchor — spot 18.4%. */
+function heatedWish(overrides: Partial<ReconcileMarket> & { index: number }): ReconcileMarket {
+  return wish({
+    anchorApy: 0.046,
+    totalSupplyAssets: parseEther('3600000'),
+    totalBorrowAssets: parseEther('3600000'),
+    ...overrides,
+  });
+}
+
+describe('priority deposit carve (PRIMARY market) over the 20% cap', () => {
+  it('gives the priority deposit the whole budget even though its spot rate is the lowest', () => {
+    // Budget 200k (6.8M sleeve, cap 7M). PT spot ~3.5% vs the heated market's 18.4%:
+    // waterfilling would send every dollar to the heated market, but PRIMARY is the
+    // declared destination, not a yield pick.
+    const legs = reconcile([
+      primaryWish({ index: 0, delta: parseEther('200000') }),
+      heatedWish({ index: 1, delta: parseEther('500000') }),
+    ], parseEther('6800000'));
+
+    expect(legs[0].delta).toBe(parseEther('200000'));
+    expect(legs[0].note).toBeUndefined();
+    expect(legs[1].delta).toBe(0n);
+    expect(legs[1].note).toMatch(/waterfilled/);
+  });
+
+  it('cuts a priority wish larger than the budget to the budget and leaves the others nothing', () => {
+    // Budget 200k (6.8M sleeve, cap 7M) against a 500k PRIMARY wish.
+    const legs = reconcile([
+      primaryWish({ index: 0, delta: parseEther('500000') }),
+      heatedWish({ index: 1, delta: parseEther('500000') }),
+    ], parseEther('6800000'));
+
+    expect(legs[0].delta).toBe(parseEther('200000'));
+    expect(legs[0].note).toMatch(/priority, served first/);
+    expect(legs[1].delta).toBe(0n);
+  });
+
+  it('waterfills the remainder after the carve among the ordinary deposits', () => {
+    // Budget 400k (6.6M sleeve, cap 7M): PRIMARY takes its 100k off the top; the
+    // remaining 300k splits between two same-anchor fully-utilized markets in
+    // proportion to borrow — 3M:2M -> 180k:120k.
+    const legs = reconcile([
+      primaryWish({ index: 0, delta: parseEther('100000') }),
+      wish({ index: 1, delta: parseEther('500000'), anchorApy: 0.03, totalSupplyAssets: parseEther('3000000'), totalBorrowAssets: parseEther('3000000') }),
+      wish({ index: 2, delta: parseEther('500000'), anchorApy: 0.03, totalSupplyAssets: parseEther('2000000'), totalBorrowAssets: parseEther('2000000') }),
+    ], parseEther('6600000'));
+
+    expect(legs[0].delta).toBe(parseEther('100000'));
+    expect(legs[1].delta).toBeGreaterThanOrEqual(parseEther('179998'));
+    expect(legs[1].delta).toBeLessThanOrEqual(parseEther('180001'));
+    expect(legs[2].delta).toBeGreaterThanOrEqual(parseEther('119998'));
+    expect(legs[2].delta).toBeLessThanOrEqual(parseEther('120001'));
+  });
+
+  it('never lets carve plus waterfill exceed the budget', () => {
+    // Budget 400k (6.6M sleeve, cap 7M): 150k carve, then the 250k remainder splits
+    // between two same-anchor fully-utilized markets 3.6M:3M -> ~136k:~114k (both
+    // above the 100k min action, so no leg is dropped). The three legs must land the
+    // sleeve at or under the 7M cap, exactly — the cap is hard.
+    const legs = reconcile([
+      primaryWish({ index: 0, delta: parseEther('150000') }),
+      heatedWish({ index: 1, delta: parseEther('500000') }),
+      heatedWish({ index: 2, delta: parseEther('500000'), totalSupplyAssets: parseEther('3000000'), totalBorrowAssets: parseEther('3000000') }),
+    ], parseEther('6600000'));
+
+    const filled = legs[0].delta + legs[1].delta + legs[2].delta;
+    expect(legs[1].delta).toBeGreaterThan(parseEther('100000'));
+    expect(legs[2].delta).toBeGreaterThan(parseEther('100000'));
+    expect(filled).toBeLessThanOrEqual(parseEther('400000'));
+    expect(filled).toBeGreaterThan(parseEther('399999'));
+    expect(parseEther('6600000') + filled).toBeLessThanOrEqual(parseEther('7000000'));
+  });
+
+  it('fills the priority deposit even when every ordinary market earns a zero spot rate', () => {
+    // Budget 200k (6.8M sleeve, cap 7M). The ordinary market has no borrows, so the
+    // waterfill's zero-rate guard fills nothing there — the carve is not ranked by
+    // rate and is untouched by that guard.
+    const legs = reconcile([
+      primaryWish({ index: 0, delta: parseEther('150000') }),
+      wish({ index: 1, delta: parseEther('500000'), totalBorrowAssets: 0n }),
+    ], parseEther('6800000'));
+
+    expect(legs[0].delta).toBe(parseEther('150000'));
+    expect(legs[0].note).toBeUndefined();
+    expect(legs[1].delta).toBe(0n);
+    expect(legs[1].note).toMatch(/sleeve cap/);
+  });
+
+  it('refuses two priority deposits when the cap binds', () => {
+    // The carve is defined for one PRIMARY market; a second one is a config bug.
+    expect(() => reconcile([
+      primaryWish({ index: 0, delta: parseEther('300000') }),
+      primaryWish({ index: 1, name: 'cbBTC/USDS', delta: parseEther('300000') }),
+    ], parseEther('6800000'))).toThrow(/all carry priority deposits/);
+  });
+
+  it('passes the priority deposit and its siblings through untouched when the sleeve fits', () => {
+    // 6M sleeve + 500k + 300k = 6.8M — inside [5.25M, 7M], so no carve, no waterfill.
+    const legs = reconcile([
+      primaryWish({ index: 0, delta: parseEther('500000') }),
+      heatedWish({ index: 1, delta: parseEther('300000') }),
+    ], parseEther('6000000'));
+
+    expect(legs[0].delta).toBe(parseEther('500000'));
+    expect(legs[0].note).toBeUndefined();
+    expect(legs[1].delta).toBe(parseEther('300000'));
+    expect(legs[1].note).toBeUndefined();
+  });
+});
+
+/**
+ * Cap-breach withdrawal of a STEERED market: no band, priority, judged against the
+ * 50k min priority withdrawal.
+ */
+function breachWish(overrides: Partial<ReconcileMarket> & { index: number }): ReconcileMarket {
+  return wish({
+    priority: true,
+    bandUtilBps: undefined,
+    minActionUsds: parseEther('50000'),
+    ...overrides,
+  });
+}
+
+/** Cap-breach withdrawal of the PRIMARY market (PT-sUSDS/USDS above its cap). */
+function primaryBreachWish(overrides: Partial<ReconcileMarket> & { index: number }): ReconcileMarket {
+  return breachWish({
+    name: 'PT-sUSDS/USDS',
+    primary: true,
+    totalSupplyAssets: parseEther('2415000'),
+    totalBorrowAssets: parseEther('2198000'),
+    anchorApy: 0.0293,
+    ...overrides,
+  });
+}
+
+describe('priority withdrawals (cap breaches) under the 15% floor', () => {
+  it('serves the priority withdrawal before the band tier when the budget covers only it', () => {
+    // Budget 200k (5.45M sleeve, floor 5.25M): the 200k breach takes it all; the
+    // 9500-tier wish waits.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('200000') }),
+      wish({ index: 1, delta: -parseEther('300000'), bandUtilBps: 9500 }),
+    ], parseEther('5450000'));
+
+    expect(legs[0].delta).toBe(-parseEther('200000'));
+    expect(legs[0].note).toBeUndefined();
+    expect(legs[1].delta).toBe(0n);
+    expect(legs[1].note).toMatch(/sleeve floor/);
+  });
+
+  it('serves the PRIMARY market\'s priority withdrawal before a larger one when the budget covers only one', () => {
+    // Budget 200k (5.45M sleeve, floor 5.25M). The 400k cbBTC breach is listed first
+    // and is twice the size, but the PRIMARY market's 200k breach is paid first and
+    // takes the whole budget; cbBTC waits.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('400000') }),
+      primaryBreachWish({ index: 1, delta: -parseEther('200000') }),
+    ], parseEther('5450000'));
+
+    expect(legs[0].delta).toBe(0n);
+    expect(legs[0].note).toMatch(/priority, served first/);
+    expect(legs[1].delta).toBe(-parseEther('200000'));
+    expect(legs[1].note).toBeUndefined();
+  });
+
+  it('serves the largest non-PRIMARY priority withdrawal first, regardless of market order', () => {
+    // Budget 300k (5.55M sleeve, floor 5.25M). The 200k cbBTC breach is listed first,
+    // but the larger 400k wstETH breach is paid first and takes the whole budget;
+    // cbBTC waits.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('200000') }),
+      breachWish({ index: 1, name: 'wstETH/USDS', delta: -parseEther('400000') }),
+    ], parseEther('5550000'));
+
+    expect(legs[0].delta).toBe(0n);
+    expect(legs[0].note).toMatch(/priority, served first/);
+    expect(legs[1].delta).toBe(-parseEther('300000'));
+    expect(legs[1].note).toMatch(/priority, served first/);
+  });
+
+  it('pays the PRIMARY breach, then the other breaches largest first, then the band tiers', () => {
+    // Budget 700k (5.95M sleeve, floor 5.25M). PRIMARY's 200k breach (listed last)
+    // comes off the top; wstETH's 200k and cbBTC's 150k breaches follow, largest
+    // first; the 150k left lands on the 9500 tier, and the 9200 tier waits.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('150000') }),
+      breachWish({ index: 1, name: 'wstETH/USDS', delta: -parseEther('200000') }),
+      primaryBreachWish({ index: 2, delta: -parseEther('200000') }),
+      wish({ index: 3, delta: -parseEther('300000'), bandUtilBps: 9500 }),
+      wish({ index: 4, delta: -parseEther('400000'), bandUtilBps: 9200 }),
+    ], parseEther('5950000'));
+
+    expect(legs[0].delta).toBe(-parseEther('150000'));
+    expect(legs[1].delta).toBe(-parseEther('200000'));
+    expect(legs[2].delta).toBe(-parseEther('200000'));
+    expect(legs[3].delta).toBe(-parseEther('150000'));
+    expect(legs[3].note).toMatch(/sleeve floor/);
+    expect(legs[4].delta).toBe(0n);
+    expect(legs[4].note).toMatch(/sleeve floor/);
+  });
+
+  it('never drains a priority wish past its own size', () => {
+    // Budget 500k (5.75M sleeve, floor 5.25M) exceeds the 200k breach: the drain is
+    // exactly the wish, and the 9500 tier takes the 300k left over.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('200000') }),
+      wish({ index: 1, delta: -parseEther('600000'), bandUtilBps: 9500 }),
+    ], parseEther('5750000'));
+
+    expect(legs[0].delta).toBe(-parseEther('200000'));
+    expect(legs[0].note).toBeUndefined();
+    expect(legs[1].delta).toBe(-parseEther('300000'));
+  });
+
+  it('hands the remainder after the priority withdrawal to the band tiers, 95 before 92', () => {
+    // Budget 650k (5.9M sleeve, floor 5.25M): 200k breach first, then tier 95 (300k)
+    // whole, then tier 92 gets the last 150k.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('200000') }),
+      wish({ index: 1, delta: -parseEther('300000'), bandUtilBps: 9500 }),
+      wish({ index: 2, delta: -parseEther('400000'), bandUtilBps: 9200 }),
+    ], parseEther('5900000'));
+
+    expect(legs[0].delta).toBe(-parseEther('200000'));
+    expect(legs[1].delta).toBe(-parseEther('300000'));
+    expect(legs[1].note).toBeUndefined();
+    expect(legs[2].delta).toBe(-parseEther('150000'));
+    expect(legs[2].note).toMatch(/sleeve floor/);
+  });
+
+  it('still refuses a non-priority withdrawal that carries no band', () => {
+    // An ordinary drain with no tier key cannot be placed in the floor cut.
+    expect(() => reconcile([
+      wish({ index: 0, delta: -parseEther('400000'), bandUtilBps: undefined }),
+    ], parseEther('5300000'))).toThrow(/withdrawal wish without a band/);
+  });
+
+  it('accepts a priority withdrawal without a band', () => {
+    // Budget 200k (5.45M sleeve, floor 5.25M): a priority withdrawal has no band by
+    // design and is served off the top regardless.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('400000') }),
+    ], parseEther('5450000'));
+
+    expect(legs[0].delta).toBe(-parseEther('200000'));
+    expect(legs[0].note).toMatch(/priority, served first/);
+  });
+});
+
+describe('per-leg drop threshold (minActionUsds override)', () => {
+  it('keeps a 60k breach leg under a 50k market threshold that the global 100k would drop', () => {
+    // Sleeve 6M, inside the limits: the only gate is the drop threshold.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('60000') }),
+    ], parseEther('6000000'));
+
+    expect(legs[0].delta).toBe(-parseEther('60000'));
+    expect(legs[0].note).toBeUndefined();
+  });
+
+  it('keeps a leg landing exactly on its own 50k threshold', () => {
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('50000') }),
+    ], parseEther('6000000'));
+
+    expect(legs[0].delta).toBe(-parseEther('50000'));
+    expect(legs[0].note).toBeUndefined();
+  });
+
+  it('keeps a 1-wei leg when the market threshold is 0 (zero-cap drain to dust)', () => {
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -1n, minActionUsds: 0n }),
+    ], parseEther('6000000'));
+
+    expect(legs[0].delta).toBe(-1n);
+    expect(legs[0].note).toBeUndefined();
+  });
+
+  it('falls back to the global 100k threshold when the market sets none', () => {
+    const legs = reconcile([
+      wish({ index: 0, delta: -parseEther('60000'), minActionUsds: undefined }),
+    ], parseEther('6000000'));
+
+    expect(legs[0].delta).toBe(0n);
+    expect(legs[0].note).toMatch(/min action 100000 USDS/);
+  });
+
+  it('drops a priority leg the floor cuts below its own 50k threshold', () => {
+    // Budget 40k (5.29M sleeve, floor 5.25M): the 200k breach is cut to 40k, under
+    // the market's 50k threshold — nothing executes this cycle.
+    const legs = reconcile([
+      breachWish({ index: 0, delta: -parseEther('200000') }),
+    ], parseEther('5290000'));
+
+    expect(legs[0].delta).toBe(0n);
+    expect(legs[0].note).toMatch(/min action 50000 USDS/);
   });
 });

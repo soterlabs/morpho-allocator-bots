@@ -4,4 +4,4 @@ buildCommand = "npm install && npm run build"
 
 [deploy]
 startCommand = "npm start"
-cronSchedule = "*/20 * * * *"
+cronSchedule = "0 * * * *"
