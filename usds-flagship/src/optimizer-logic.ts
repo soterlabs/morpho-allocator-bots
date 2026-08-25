@@ -311,14 +311,14 @@ export function computeVaultApy(
 }
 
 /**
- * Effective optimizer bound for one market: the on-chain relative-cap limit with
- * CAP_HEADROOM_BPS headroom, further clamped by the market's off-chain absolute
- * cap when one is configured (e.g. PT-sUSDS's 5M USDS).
+ * Effective deposit ceiling for one market: the on-chain relative-cap limit with
+ * CAP_HEADROOM_BPS headroom, further clamped by the bot-side cap when one is
+ * configured (the bps mode's absoluteCap, the bands mode's marketCap).
  */
-export function computeEffectiveMarketCap(totalAssets: bigint, relativeCapWad: bigint, absoluteCap?: bigint): bigint {
+export function computeEffectiveMarketCap(totalAssets: bigint, relativeCapWad: bigint, offChainCap?: bigint): bigint {
   const capLimit = computeCapLimit(totalAssets, relativeCapWad);
   const withHeadroom = capLimit - (capLimit * CAP_HEADROOM_BPS) / 10000n;
-  return absoluteCap !== undefined && absoluteCap < withHeadroom ? absoluteCap : withHeadroom;
+  return offChainCap !== undefined && offChainCap < withHeadroom ? offChainCap : withHeadroom;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, maxWithdrawableWithReserve, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
@@ -1264,6 +1264,33 @@ describe('maxWithdrawableForUtilization', () => {
     const w = maxWithdrawableForUtilization(supply, borrow, 9300);
     expect(w).toBeGreaterThan(0n);
     expect(w).toBeLessThan(supply - borrow); // less than the full 200 idle
+  });
+});
+
+describe('maxWithdrawableWithReserve', () => {
+  // cbBTC/USDS-like pool: 4.2M supply, 3.72M borrow -> 480k idle; a 5% reserve is 210k.
+  const SUPPLY = eth('4200000');
+
+  it('returns idle liquidity minus the reserve', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('3720000'), 5n)).toBe(eth('270000'));
+  });
+
+  it('returns 0 when the reserve exceeds idle liquidity', () => {
+    // 150k idle < 210k reserve.
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('4050000'), 5n)).toBe(0n);
+  });
+
+  it('returns 0 when idle liquidity exactly equals the reserve', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('3990000'), 5n)).toBe(0n);
+  });
+
+  it('returns 0 when borrows reach or exceed supply', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, SUPPLY, 5n)).toBe(0n);
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('4200001'), 5n)).toBe(0n);
+  });
+
+  it('returns the full idle liquidity with a 0% reserve', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('3720000'), 0n)).toBe(eth('480000'));
   });
 });
 

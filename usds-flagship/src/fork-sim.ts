@@ -29,7 +29,7 @@ import { createPublicClient, http, encodeFunctionData, formatEther, parseEther, 
 import { Market, MarketParams } from '@morpho-org/blue-sdk';
 import {
   USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi,
-  encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId,
+  encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId, validateBandsMarkets,
 } from './market-config.js';
 import { parseBandConfig, computeSsrApy, assertSsrSane } from './band-config.js';
 import { computeBandDecisions, type BandDecision, type MarketObservation } from './band-controller.js';
@@ -38,9 +38,9 @@ import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
 import { anchorPerSecWadToApy } from './anchor-sim.js';
 import {
   capDeallocationsToLiquidity, computeCapLimit, computeAllocationBudget, capAllocationsToBudget,
-  CAP_HEADROOM_BPS, type MarketLiquidity, type AllocationAction,
+  CAP_HEADROOM_BPS, LIQUIDITY_RESERVE_PERCENT, type MarketLiquidity, type AllocationAction,
 } from './allocation-logic.js';
-import { computeEffectiveMarketCap } from './optimizer-logic.js';
+import { bandsCaps, toReconcileMarket } from './band-plan.js';
 
 // Mainnet Flagship deployment (README "Roles"); overridable for other deployments.
 const VAULT = (process.env.VAULT_ADDRESS || '0xE15fcC81118895b67b6647BBd393182dF44E11E0') as Address;
@@ -52,7 +52,7 @@ const SAFE = (process.env.SAFE_ADDRESS || '0xE4d5F54CE1830d5eCC49751021F306CFE7a
 const SLEEVE_CAP_BPS = 2000;
 
 // Simulator-only knobs. Hours between cycles is deliberately larger than the production
-// 20-min cadence: on a fork borrowers never react, so longer gaps are what make anchor
+// hourly cadence: on a fork borrowers never react, so longer gaps are what make anchor
 // drift visible within a handful of cycles.
 const CYCLES = Number(process.env.SIM_CYCLES || '8');
 const CYCLE_HOURS = Number(process.env.SIM_CYCLE_HOURS || '6');
@@ -66,6 +66,7 @@ const INFLOW_USDS = parseEther(process.env.SIM_INFLOW_USDS || '0');
 const DEPOSITOR = '0x1111111111111111111111111111111111111111' as Address;
 
 const cfg = parseBandConfig(process.env);
+validateBandsMarkets(markets);
 
 interface TenderlyCreds { key: string; account: string; project: string }
 
@@ -349,23 +350,18 @@ function planCycle(s: Snapshot): { decisions: BandDecision[]; calls: PlannedCall
     totalBorrowAssets: s.borrow[i],
     vaultAssets: s.vaultAssets[i],
     anchorApy: s.anchorApy[i],
-    effectiveCap: computeEffectiveMarketCap(s.totalAssets, s.collateralCapWad[i], m.absoluteCap),
+    ...bandsCaps(m, s.totalAssets, s.collateralCapWad[i]),
     lastAllocateAtSec: actionLedger.get(i)?.lastAllocateAtSec,
     lastDeallocateAtSec: actionLedger.get(i)?.lastDeallocateAtSec,
   }));
 
-  const decisions = computeBandDecisions({ markets: observations, cfg, ssrApy: s.ssrApy, nowSec: s.tsSec });
+  const decisions = computeBandDecisions({
+    markets: observations, cfg, ssrApy: s.ssrApy, nowSec: s.tsSec, liquidityReservePercent: LIQUIDITY_RESERVE_PERCENT,
+  });
 
   const sleeve = s.vaultAssets.reduce((sum, x) => sum + x, 0n);
-  const reconcileInputs: ReconcileMarket[] = markets.map((m, i) => ({
-    index: i,
-    name: m.name,
-    delta: decisions[i].targetAmount - s.vaultAssets[i],
-    bandUtilBps: decisions[i].bandUtilBps,
-    totalSupplyAssets: s.supply[i],
-    totalBorrowAssets: s.borrow[i],
-    anchorApy: s.anchorApy[i],
-  }));
+  const reconcileInputs: ReconcileMarket[] = markets.map(
+    (m, i) => toReconcileMarket(m, observations[i], decisions[i], cfg));
   const legs = reconcileToVaultLimits({
     markets: reconcileInputs,
     sleeveUsds: sleeve,
@@ -388,14 +384,15 @@ function planCycle(s: Snapshot): { decisions: BandDecision[]; calls: PlannedCall
   });
 
   // Deallocations first, liquidity-capped exactly like the executor: a drain may not
-  // push utilization past the market's band (fallback: the static drain ceiling).
+  // push utilization past the market's band; a band-less drain (cap breach) keeps the
+  // flat supply-reserve cushion.
   const drainLegs = legs.filter(l => l.delta < 0n);
   const drainActions: AllocationAction[] = drainLegs.map(l => ({ marketIndex: l.index, action: 'deallocate', amount: -l.delta }));
   const drainLiquidity: MarketLiquidity[] = drainLegs.map(l => ({
     marketIndex: l.index,
     totalSupplyAssets: s.supply[l.index],
     totalBorrowAssets: s.borrow[l.index],
-    maxUtilizationBps: decisions[l.index].bandUtilBps ?? markets[l.index].maxUtilizationBps,
+    maxUtilizationBps: decisions[l.index].bandUtilBps,
   }));
   const calls: PlannedCall[] = [];
   let totalDeallocated = 0n;
@@ -470,7 +467,7 @@ async function main() {
   console.log(`${CYCLES} cycles, ${CYCLE_HOURS}h apart | step caps: +${formatEther(cfg.maxAllocateUsds)} / -${formatEther(cfg.maxDeallocateUsds)} USDS per market per cycle`);
 
   for (const m of markets) {
-    if (m.mode === 'STEERED' && m.oracle.length !== 42) {
+    if (m.mode !== 'RETIRED' && m.oracle.length !== 42) {
       throw new Error(`${m.name} is STEERED but its ORACLE_* env is unset — the market id would be wrong`);
     }
   }
