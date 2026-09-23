@@ -73,12 +73,12 @@ monopolist share gate, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
 
 **Market caps.** Same semantics as `bps` mode: the bot keeps caps off-chain
 in env and reads the on-chain relative cap only to clamp allocations at
-execution. A market may carry an optional amount cap (`CAP_<MARKET>_USDS`,
-falling back to `PT_SUSDS_ABSOLUTE_CAP_USDS` for PT-sUSDS) and/or a share cap
-(`CAP_<MARKET>_BPS`); its cap is the smaller of those set, on the cycle's
-pinned snapshot, and deposits are additionally clamped by the on-chain
-relative cap (with the 1 bps headroom). A market with no env cap is bounded
-by the on-chain cap alone and never emits a priority withdrawal. The on-chain
+execution. Every STEERED or PRIMARY market must set an amount cap
+(`CAP_<MARKET>_USDS`, falling back to `PT_SUSDS_ABSOLUTE_CAP_USDS` for
+PT-sUSDS) and/or a share cap (`CAP_<MARKET>_BPS`) — the bot refuses to start
+with neither; RETIRED markets need none. The cap is the smaller of those set,
+on the cycle's pinned snapshot, and deposits are additionally clamped by the
+on-chain relative cap (with the 1 bps headroom). The on-chain
 cap never triggers a drain — only the env cap does: a STEERED or PRIMARY position above
 its cap by at least `MIN_PRIORITY_WITHDRAWAL_USDS` ($50k; the 100 USDS dust
 floor when the cap is 0, which drains the market down to it) becomes a
@@ -104,8 +104,10 @@ their threshold are dropped — $10k for a steering leg or a priority deposit,
 $50k for a priority withdrawal (a zero-cap withdrawal smaller than that
 passes only as a whole).
 
-Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH, WETH) | `PRIMARY`
-(PT-sUSDS — filled to its cap first) | `RETIRED` (stUSDS — never touched).
+Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH) | `PRIMARY`
+(PT-sUSDS — filled to its cap first) | `RETIRED` (stUSDS, WETH — never
+touched; keep `ORACLE_WETH` set so any residual WETH position stays visible
+to the completeness check).
 Cadence `0 * * * *` (hourly);
 `BOT_PAUSED=true` is the kill switch; `bps` mode remains the
 **decision-identical** rollback — allocation decisions are unchanged from the

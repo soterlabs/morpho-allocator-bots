@@ -38,7 +38,7 @@ import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
 import { anchorPerSecWadToApy } from './anchor-sim.js';
 import {
   capDeallocationsToLiquidity, computeCapLimit, computeAllocationBudget, capAllocationsToBudget,
-  CAP_HEADROOM_BPS, LIQUIDITY_RESERVE_PERCENT, type MarketLiquidity, type AllocationAction,
+  CAP_HEADROOM_BPS, FLOOR_LANDING_MARGIN_USDS, LIQUIDITY_RESERVE_PERCENT, type MarketLiquidity, type AllocationAction,
 } from './allocation-logic.js';
 import { bandsCaps, toReconcileMarket } from './band-plan.js';
 
@@ -369,6 +369,7 @@ function planCycle(s: Snapshot): { decisions: BandDecision[]; calls: PlannedCall
     sleeveFloorBps: cfg.sleeveFloorBps,
     sleeveCapBps: SLEEVE_CAP_BPS,
     minActionUsds: cfg.minBandActionUsds,
+    floorMarginUsds: FLOOR_LANDING_MARGIN_USDS,
   });
 
   console.log('\n  decisions:');

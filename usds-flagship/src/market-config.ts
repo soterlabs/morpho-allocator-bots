@@ -43,12 +43,13 @@ export interface MarketConfig {
   // bands mode: the market's cap unless CAP_<MARKET>_USDS overrides it. Used by
   // PT-sUSDS/USDS (5M cap).
   absoluteCap?: bigint;
-  // Optional bands-mode caps from CAP_<MARKET>_USDS (whole USDS) and CAP_<MARKET>_BPS
-  // (share of totalAssets) — off-chain mirrors of the vault's caps, same semantics as the
-  // bps mode's absoluteCap: the bot never reads the on-chain absolute cap, and a breach of
-  // these (not of the on-chain relative cap) is what triggers a priority withdrawal. A
-  // market with neither is bounded only by the on-chain relative cap at allocate time and
-  // never emits a priority withdrawal. 0 means "hold nothing" — drained down to the dust floor.
+  // Bands-mode caps from CAP_<MARKET>_USDS (whole USDS) and CAP_<MARKET>_BPS (share of
+  // totalAssets) — off-chain mirrors of the vault's caps, same semantics as the bps mode's
+  // absoluteCap: the bot never reads the on-chain absolute cap, and a breach of these (not
+  // of the on-chain relative cap) is what triggers a priority withdrawal. Every non-RETIRED
+  // market must set at least one in bands mode (validateBandsMarkets), so the breach line
+  // is always a conscious operator choice; only a RETIRED market may have neither. 0 means
+  // "hold nothing" — drained down to the dust floor.
   capUsds?: bigint;
   capBps?: number;
   // When true, this market absorbs an equal share of overflow from absolute-capped markets on
@@ -129,8 +130,8 @@ function parseOptionalCapUsds(raw: string | undefined, label: string): bigint | 
  * Bands-mode cap of a market in USDS on the given totalAssets snapshot: the smaller of
  * the amount cap (CAP_<MARKET>_USDS, else the bps-mode absoluteCap) and the share cap
  * (CAP_<MARKET>_BPS x totalAssets), over whichever of the two is configured.
- * Undefined when the market has neither — it is then bounded only by the on-chain
- * relative cap, exactly as in bps mode.
+ * Undefined when the market has neither (only a RETIRED market may, see
+ * validateBandsMarkets) — it is then bounded only by the on-chain relative cap.
  */
 export function computeMarketCap(market: MarketConfig, totalAssets: bigint): bigint | undefined {
   const capUsds = market.capUsds ?? market.absoluteCap;
@@ -141,15 +142,27 @@ export function computeMarketCap(market: MarketConfig, totalAssets: bigint): big
 }
 
 /**
- * Startup validation of the market table for bands mode: at most one market may be
- * PRIMARY — the priority carve is defined for one market. Throws (refuses to start)
- * otherwise.
+ * Startup validation of the market table for bands mode. Throws (refuses to start) when:
+ *   - more than one market is PRIMARY — the priority carve is defined for one market;
+ *   - a non-RETIRED market sets neither CAP_<MARKET>_USDS nor CAP_<MARKET>_BPS — without
+ *     a cap the market has no breach line, so the priority-withdrawal safety net would be
+ *     silently unarmed while the operator believes it is on. The PT-sUSDS fallback to
+ *     PT_SUSDS_ABSOLUTE_CAP_USDS does not count: the cap must be set explicitly.
  */
 export function validateBandsMarkets(marketTable: readonly MarketConfig[]): void {
   const primaries = marketTable.filter(m => m.mode === 'PRIMARY');
   if (primaries.length > 1) {
     throw new Error(
       `${primaries.map(m => m.name).join(', ')} are all PRIMARY — at most one market may be PRIMARY`
+    );
+  }
+  const uncapped = marketTable.filter(
+    m => m.mode !== 'RETIRED' && m.capUsds === undefined && m.capBps === undefined);
+  if (uncapped.length > 0) {
+    throw new Error(
+      `${uncapped.map(m => m.name).join(', ')}: STEERED/PRIMARY but no cap configured — ` +
+      `set CAP_<MARKET>_USDS and/or CAP_<MARKET>_BPS (at least one; 0 = hold nothing) ` +
+      `or set MODE_<MARKET>=RETIRED.`
     );
   }
 }
@@ -247,7 +260,7 @@ export const markets: MarketConfig[] = [
     lltv: BigInt(process.env.LLTV_WETH || LLTV_86_PERCENT),
     targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, 0, 'TARGET_WETH_BPS'),
     maxUtilizationBps: WETH_MAX_UTILIZATION_BPS,
-    mode: parseMarketMode(process.env.MODE_WETH, 'STEERED', 'MODE_WETH'),
+    mode: parseMarketMode(process.env.MODE_WETH, 'RETIRED', 'MODE_WETH'),
     ssrTMarginBps: parseOptionalBps(process.env.SSR_T_MARGIN_WETH_BPS, 'SSR_T_MARGIN_WETH_BPS'),
     capUsds: parseOptionalCapUsds(process.env.CAP_WETH_USDS, 'CAP_WETH_USDS'),
     capBps: parseOptionalBps(process.env.CAP_WETH_BPS, 'CAP_WETH_BPS'),

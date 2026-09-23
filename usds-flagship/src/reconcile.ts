@@ -14,10 +14,11 @@
  *     level, so no dollar of the remaining budget could be moved to a better market.
  *     The deposit budget credits same-batch withdrawals.
  *
- *   - withdrawals break the floor -> priority withdrawals are served first (the
- *     PRIMARY market's ahead of the others, then the largest first), then the band
- *     wishes are cut in tiers from the deepest band down: whole tiers are served
- *     fully; the tier the budget cannot cover lands on one common utilization
+ *   - withdrawals break the floor (raised by the landing margin, see
+ *     floorMarginUsds) -> priority withdrawals are served first (the PRIMARY
+ *     market's ahead of the others, then the largest first), then the band wishes
+ *     are cut in tiers from the deepest band down: whole tiers are served fully; the
+ *     tier the budget cannot cover lands on one common utilization
  *     u* = pooledBorrow / (pooledSupply - budget), so every market in it heats at
  *     the same tempo; shallower tiers wait. The withdrawal budget credits same-batch
  *     deposits.
@@ -313,8 +314,15 @@ export function reconcileToVaultLimits(args: {
   sleeveCapBps: number;
   /** Drop threshold for legs whose market sets no minActionUsds of its own. */
   minActionUsds: bigint;
+  /**
+   * A floor-bound plan lands this far ABOVE the floor (FLOOR_LANDING_MARGIN_USDS in
+   * production). The executor may send an allocate slightly under its leg while the
+   * deallocations execute in full, so a plan resting exactly on the floor would end the
+   * batch under it and the batch guard would abort every cycle in that state.
+   */
+  floorMarginUsds: bigint;
 }): ReconciledLeg[] {
-  const { markets, sleeveUsds, totalAssets, sleeveFloorBps, sleeveCapBps, minActionUsds } = args;
+  const { markets, sleeveUsds, totalAssets, sleeveFloorBps, sleeveCapBps, minActionUsds, floorMarginUsds } = args;
 
   const deposits = markets.filter(m => m.delta > 0n);
   const withdrawals = markets.filter(m => m.delta < 0n);
@@ -323,7 +331,7 @@ export function reconcileToVaultLimits(args: {
   const sleeveAfter = sleeveUsds + depositTotal - withdrawalTotal;
 
   const cap = (totalAssets * BigInt(sleeveCapBps)) / 10000n;
-  const floor = (totalAssets * BigInt(sleeveFloorBps)) / 10000n;
+  const floor = (totalAssets * BigInt(sleeveFloorBps)) / 10000n + floorMarginUsds;
 
   const legs: ReconciledLeg[] = markets.map(m => ({ index: m.index, delta: m.delta }));
 

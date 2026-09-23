@@ -22,9 +22,11 @@ function wish(overrides: Partial<ReconcileMarket> & { index: number }): Reconcil
 
 /**
  * The suite's global drop threshold is 100k so a floor/cap cut visibly lands a leg
- * under it; the production value comes from BandConfig, not from reconciliation.
+ * under it; the production value comes from BandConfig, not from reconciliation. The
+ * floor landing margin is 0 unless a test is about it, so the floor cuts below read as
+ * round production-scale numbers.
  */
-function reconcile(markets: ReconcileMarket[], sleeveUsds: bigint) {
+function reconcile(markets: ReconcileMarket[], sleeveUsds: bigint, floorMarginUsds = 0n) {
   return reconcileToVaultLimits({
     markets,
     sleeveUsds,
@@ -32,6 +34,7 @@ function reconcile(markets: ReconcileMarket[], sleeveUsds: bigint) {
     sleeveFloorBps: 1500,
     sleeveCapBps: 2000,
     minActionUsds: parseEther('100000'),
+    floorMarginUsds,
   });
 }
 
@@ -575,5 +578,42 @@ describe('per-leg drop threshold (minActionUsds override)', () => {
 
     expect(legs[0].delta).toBe(0n);
     expect(legs[0].note).toMatch(/min action 50000 USDS/);
+  });
+});
+
+describe('floor landing margin', () => {
+  const MARGIN = parseEther('100');
+
+  it('lands a floor-bound plan with a deposit exactly margin above the floor', () => {
+    // Sleeve 5.4M, floor 5.25M, +200k deposit: without the margin the drain would be
+    // cut to 350k and the plan would rest on the floor; with a 100 USDS margin it is
+    // cut to 349,900 so an allocate executed a few USDS short still clears the floor.
+    const legs = reconcile([
+      wish({ index: 0, delta: parseEther('200000') }),
+      wish({ index: 1, delta: -parseEther('800000'), bandUtilBps: 9500 }),
+    ], parseEther('5400000'), MARGIN);
+
+    expect(legs[0].delta).toBe(parseEther('200000'));
+    expect(legs[1].delta).toBe(-parseEther('349900'));
+    expect(legs[1].note).toMatch(/sleeve floor/);
+  });
+
+  it('cuts a batch that would land inside the margin band, not only one below the floor', () => {
+    // Sleeve 5.55M, -300k lands at 5.25M + 0: exactly the floor, which the margin
+    // treats as too close — the drain is trimmed by the margin.
+    const legs = reconcile([
+      wish({ index: 0, delta: -parseEther('300000'), bandUtilBps: 9500 }),
+    ], parseEther('5550000'), MARGIN);
+
+    expect(legs[0].delta).toBe(-parseEther('299900'));
+  });
+
+  it('leaves a batch alone that already lands above the margin', () => {
+    const legs = reconcile([
+      wish({ index: 0, delta: -parseEther('300000'), bandUtilBps: 9500 }),
+    ], parseEther('5550100'), MARGIN);
+
+    expect(legs[0].delta).toBe(-parseEther('300000'));
+    expect(legs[0].note).toBeUndefined();
   });
 });

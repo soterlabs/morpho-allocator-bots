@@ -84,16 +84,17 @@ A priority withdrawal skips all of this — see below.
 
 Same semantics as `bps` mode: caps live off-chain in env (the bot never
 reads the on-chain absolute cap), and the on-chain relative cap is read only
-to clamp allocations at execution. A market may carry an optional amount cap
-(`CAP_<MARKET>_USDS`, whole USDS — PT-sUSDS falls back to
-`PT_SUSDS_ABSOLUTE_CAP_USDS`, its bps-mode cap) and/or an optional share cap
-(`CAP_<MARKET>_BPS`, bps of totalAssets). On the cycle's pinned snapshot:
+to clamp allocations at execution. Every STEERED or PRIMARY market **must**
+set at least one of an amount cap (`CAP_<MARKET>_USDS`, whole USDS) and a
+share cap (`CAP_<MARKET>_BPS`, bps of totalAssets) — the bot refuses to start
+otherwise, so a market's breach line is always a conscious choice. Only a
+RETIRED market may have neither. For PT-sUSDS the amount side additionally
+falls back to `PT_SUSDS_ABSOLUTE_CAP_USDS` (its bps-mode cap) when only
+`CAP_PTSUSDS_BPS` is set. On the cycle's pinned snapshot:
 
-- `marketCap` = the smaller of the caps set — the breach line; undefined for
-  a market with no env cap, which then never emits a priority withdrawal.
+- `marketCap` = the smaller of the caps set — the breach line.
 - `effectiveCap = min(on-chain relative cap − 1 bps headroom, marketCap)` —
-  the deposit ceiling; band targets and the PRIMARY fill clamp to it (just
-  the on-chain bound when there is no env cap).
+  the deposit ceiling; band targets and the PRIMARY fill clamp to it.
 
 The on-chain relative cap only clamps deposits; it never triggers a drain.
 
@@ -157,6 +158,15 @@ already sized it above the 100 USDS dust floor, and it bypasses the
 executor's dust floor so the market ends holding nothing) while a floor cut
 leaving only part of it is dropped. An empty batch does not fly.
 
+A floor cut lands the plan 100 USDS **above** the floor
+(`FLOOR_LANDING_MARGIN_USDS`): the executor may send an allocate slightly
+under its leg (live cap below the pinned one, interest accrued since the
+pinned block) while the deallocations go out in full, and a plan resting
+exactly on the floor would then fail the batch guard every cycle. In bands
+mode the executor sizes each allocate as the reconciled leg itself, shrunk
+only by the live on-chain cap — the 1 bps headroom is applied to the cap, not
+to the target the controller already headroomed.
+
 ## Market modes
 
 | mode | behavior |
@@ -172,7 +182,7 @@ leaving only part of it is dropped. An empty batch does not fly.
 | cbBTC/USDS (1) | `MODE_CBBTC` | `STEERED` | `STEERED` |
 | wstETH/USDS (2) | `MODE_WSTETH` | `STEERED` | `STEERED` |
 | PT-sUSDS/USDS (3) | `MODE_PTSUSDS` | `STEERED` | `PRIMARY` |
-| WETH/USDS (4) | `MODE_WETH` | `STEERED` | `STEERED` |
+| WETH/USDS (4) | `MODE_WETH` | `RETIRED` | `RETIRED` |
 
 ## Environment variables (bands mode)
 
@@ -182,8 +192,8 @@ leaving only part of it is dropped. An empty batch does not fly.
 | `BOT_PAUSED` | `false` | `true` → log `paused`, exit 0 |
 | `MAX_ALLOCATE_USDS` | **REQUIRED** (≥ `MIN_BAND_ACTION_USDS`) | per-market per-cycle grow step cap, whole USDS |
 | `MAX_DEALLOCATE_USDS` | **REQUIRED** (≥ `MIN_BAND_ACTION_USDS` and ≥ `MIN_PRIORITY_WITHDRAWAL_USDS`) | per-market per-cycle drain step cap (in `bps` mode stays optional, `0` = no cap) |
-| `CAP_<MARKET>_USDS` | unset (PT-sUSDS: `PT_SUSDS_ABSOLUTE_CAP_USDS`) | optional cap amount, whole USDS (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); `0` = hold nothing, drain everything |
-| `CAP_<MARKET>_BPS` | unset | optional cap as bps of totalAssets; `marketCap` = the smaller of the caps set; a market with none is bounded by the on-chain relative cap only (as in `bps` mode) and never emits a priority withdrawal |
+| `CAP_<MARKET>_USDS` | **REQUIRED** (this or `_BPS`) for every STEERED/PRIMARY market (PT-sUSDS: falls back to `PT_SUSDS_ABSOLUTE_CAP_USDS` once `_BPS` is set) | cap amount, whole USDS (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); `0` = hold nothing, drain everything |
+| `CAP_<MARKET>_BPS` | **REQUIRED** (this or `_USDS`) for every STEERED/PRIMARY market | cap as bps of totalAssets; `marketCap` = the smaller of the caps set; startup throws for a STEERED/PRIMARY market with neither; RETIRED markets need none |
 | `MIN_PRIORITY_WITHDRAWAL_USDS` | `50000` | smallest priority withdrawal, whole USDS; a smaller breach waits (a zero cap drains from the 100 USDS dust floor instead) |
 | `SSR_T_MARGIN_BPS` | `0` | global SSR_t margin for STEERED markets |
 | `SSR_T_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
@@ -198,14 +208,15 @@ leaving only part of it is dropped. An empty batch does not fly.
 | `MODE_STUSDS` | `RETIRED` | `STEERED` \| `PRIMARY` \| `RETIRED`, enum-validated (`SOUNDING` refuses to start); at most one `PRIMARY` |
 | `MODE_CBBTC` | `STEERED` | |
 | `MODE_WSTETH` | `STEERED` | |
-| `MODE_WETH` | `STEERED` | |
+| `MODE_WETH` | `RETIRED` | |
 | `MODE_PTSUSDS` | `STEERED` | `.env.example` sets `PRIMARY` |
 | `DRY_RUN` | `false` | `true` = compute + trace, execute nothing (shadow mode) |
 
 Existing allocator envs (`RPC_URL`, `PRIVATE_KEY`, `SAFE_ADDRESS`,
 `VAULT_ADDRESS`, `ADAPTER_ADDRESS`, `ORACLE_*`, `LLTV_*`) are unchanged —
-see `usds-flagship/README.md`. `PT_SUSDS_ABSOLUTE_CAP_USDS` is `bps`-mode /
-optimizer only; in bands mode PT-sUSDS is bounded by `CAP_PTSUSDS_*`.
+see `usds-flagship/README.md`. In bands mode `PT_SUSDS_ABSOLUTE_CAP_USDS`
+only serves as the amount-cap fallback for PT-sUSDS (`computeMarketCap`);
+`CAP_PTSUSDS_USDS` overrides it.
 
 ## Pre-flight safety checks
 

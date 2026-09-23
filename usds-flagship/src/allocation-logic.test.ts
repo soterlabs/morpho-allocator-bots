@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, maxWithdrawableWithReserve, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, maxWithdrawableWithReserve, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem, bandsAllocateCeiling } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
@@ -1034,6 +1034,49 @@ describe('planDeallocations', () => {
 // ============================================================
 // planAllocations — gap-to-cap with dust floor and at-cap distinction
 // ============================================================
+describe('bandsAllocateCeiling', () => {
+  // A 4M PT-sUSDS target reached from a 3M pinned position: the leg is 1M.
+  const TARGET = parseEther('4000000');
+  const PINNED = parseEther('3000000');
+
+  it('sends exactly the leg when nothing moved since the pinned block', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED, liveCapWithHeadroom: parseEther('4500000'),
+    });
+
+    expect(ceiling - PINNED).toBe(parseEther('1000000'));
+    expect(clampedByLiveCap).toBe(false);
+  });
+
+  it('keeps the leg whole when the fresh position carries accrued interest', () => {
+    // 3,000,050 fresh: the ceiling shifts by the 50 USDS of interest so the gap is still 1M.
+    const fresh = PINNED + parseEther('50');
+    const { ceiling } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: fresh, liveCapWithHeadroom: parseEther('4500000'),
+    });
+
+    expect(ceiling - fresh).toBe(parseEther('1000000'));
+  });
+
+  it('shrinks the leg only when the live cap sits below the shifted target', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED, liveCapWithHeadroom: parseEther('3800000'),
+    });
+
+    expect(ceiling).toBe(parseEther('3800000'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('uses the shifted target alone when the vault reports no live cap', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+    });
+
+    expect(ceiling).toBe(TARGET);
+    expect(clampedByLiveCap).toBe(false);
+  });
+});
+
 describe('planAllocations', () => {
   const MIN = eth('100');
   const item = (marketIndex: number, effectiveCap: bigint, freshExpected: bigint): AllocatePlanItem => ({ marketIndex, effectiveCap, freshExpected });

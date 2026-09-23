@@ -61,11 +61,33 @@ describe('validateBandsMarkets', () => {
     expect(() => validateBandsMarkets(table)).toThrow(/PT-sUSDS\/USDS, cbBTC\/USDS.*at most one/);
   });
 
-  it('passes without any env caps (caps are optional, as in bps mode)', () => {
+  it('throws on a STEERED or PRIMARY market with neither cap, naming every such market', () => {
+    const table = [
+      market('cbBTC/USDS'),
+      market('wstETH/USDS', CAPPED),
+      market('PT-sUSDS/USDS', { mode: 'PRIMARY' }),
+    ];
+    expect(() => validateBandsMarkets(table)).toThrow(/cbBTC\/USDS, PT-sUSDS\/USDS.*no cap configured/);
+  });
+
+  it('does not count the PT-sUSDS absoluteCap fallback as a configured cap', () => {
+    const table = [market('PT-sUSDS/USDS', { mode: 'PRIMARY', absoluteCap: parseEther('5000000') })];
+    expect(() => validateBandsMarkets(table)).toThrow(/PT-sUSDS\/USDS.*no cap configured/);
+  });
+
+  it('accepts either cap alone, including a zero cap', () => {
+    const table = [
+      market('cbBTC/USDS', { capBps: 1000 }),
+      market('wstETH/USDS', { capUsds: parseEther('4000000') }),
+      market('WETH/USDS', { capUsds: 0n }),
+    ];
+    expect(() => validateBandsMarkets(table)).not.toThrow();
+  });
+
+  it('lets a RETIRED market go without any cap', () => {
     const table = [
       market('stUSDS/USDS', { mode: 'RETIRED' }),
-      market('cbBTC/USDS'),
-      market('PT-sUSDS/USDS', { mode: 'PRIMARY' }),
+      market('cbBTC/USDS', CAPPED),
     ];
     expect(() => validateBandsMarkets(table)).not.toThrow();
   });

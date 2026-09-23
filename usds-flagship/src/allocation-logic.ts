@@ -28,6 +28,39 @@ export const LIQUIDITY_RESERVE_PERCENT = BigInt(process.env.LIQUIDITY_RESERVE_PE
  */
 export const DUST_FLOOR_USDS = 100n * 10n ** 18n;
 
+/**
+ * How far above the sleeve floor reconciliation lands a floor-bound plan (100 USDS).
+ * Deallocations execute in full, but an allocate can execute slightly under its plan
+ * leg (the live on-chain cap may sit below the pinned one; the fresh position carries
+ * interest accrued since the pinned block), so a plan resting exactly on the floor would
+ * end the batch a few USDS under it and the batch guard would abort — with no tx the
+ * same state recurs next cycle, an abort loop. Far above minutes of interest on one
+ * position; the guard itself still measures against the true floor.
+ */
+export const FLOOR_LANDING_MARGIN_USDS = 100n * 10n ** 18n;
+
+/**
+ * Deposit ceiling the executor sizes a bands-mode allocate against. planAllocations sends
+ * ceiling − freshExpected, so the ceiling is the plan target shifted onto the fresh
+ * position (the leg itself, whatever interest accrued since the pinned block), bounded
+ * by the live on-chain cap with headroom. The controller already applied CAP_HEADROOM_BPS
+ * to the pinned cap when it sized the target; applying it again to the target would
+ * shrink every allocate by 1 bps of the TARGET (400 USDS on a 4M target) and break a
+ * floor-landing plan in the batch guard.
+ */
+export function bandsAllocateCeiling(args: {
+  targetAmount: bigint;
+  pinnedAssets: bigint;
+  freshExpected: bigint;
+  /** Live relative-cap limit with headroom; undefined when the vault reports no cap. */
+  liveCapWithHeadroom?: bigint;
+}): { ceiling: bigint; clampedByLiveCap: boolean } {
+  const { targetAmount, pinnedAssets, freshExpected, liveCapWithHeadroom } = args;
+  const shifted = targetAmount + (freshExpected - pinnedAssets);
+  const clampedByLiveCap = liveCapWithHeadroom !== undefined && liveCapWithHeadroom < shifted;
+  return { ceiling: clampedByLiveCap ? liveCapWithHeadroom : shifted, clampedByLiveCap };
+}
+
 export interface AllocationAction {
   marketIndex: number;
   action: 'allocate' | 'deallocate';

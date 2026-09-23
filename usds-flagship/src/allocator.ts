@@ -42,7 +42,7 @@ import { mainnet } from 'viem/chains';
 import { createHash } from 'node:crypto';
 import { Market, MarketParams } from '@morpho-org/blue-sdk';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, DUST_FLOOR_USDS, LIQUIDITY_RESERVE_PERCENT, capDeallocationsToLiquidity, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, DUST_FLOOR_USDS, FLOOR_LANDING_MARGIN_USDS, LIQUIDITY_RESERVE_PERCENT, bandsAllocateCeiling, capDeallocationsToLiquidity, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi, encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId, validateBandsMarkets, validateBpsMarkets } from './market-config.js';
 import { bandsCaps, isDrainToZero, toReconcileMarket } from './band-plan.js';
 import { parseBandConfig, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
@@ -168,7 +168,7 @@ if (allocationMode === 'bps') {
     );
   }
 } else {
-  // At most one PRIMARY market.
+  // At most one PRIMARY market; every STEERED/PRIMARY market has a cap (its breach line).
   validateBandsMarkets(markets);
 
   // A steered market must be addressable: without an oracle its market id cannot be
@@ -622,6 +622,7 @@ async function computeBandPlan(
     sleeveFloorBps: cfg.sleeveFloorBps,
     sleeveCapBps: config.targetAllocatedPercent,
     minActionUsds: cfg.minBandActionUsds,
+    floorMarginUsds: FLOOR_LANDING_MARGIN_USDS,
   });
 
   // A/B borrower-reaction bracket (LOG-ONLY, no veto): for each market with an
@@ -1040,17 +1041,30 @@ async function main() {
   const freshEffectiveTargets = computeEffectiveTargetAmounts(freshTotalAssets, targetSpecs);
   const allocateCapInfo = allocateActions.map(a => {
     const market = configuredMarkets[a.marketIndex];
-    // bands mode: the cap target is the band decision's absolute amount (computed off the
-    // pinned snapshot; step caps and effectiveCap already applied by the controller).
-    // bps mode: the bps target recomputed against fresh totalAssets, as before.
-    const targetAmount = bandPlan !== undefined
-      ? bandPlan.targetAmounts[a.marketIndex]
-      : freshEffectiveTargets[a.marketIndex];
     const onchainCapWad = onchainRelativeCapWadByIndex.get(a.marketIndex);
     const onchainCapLimit = onchainCapWad !== undefined
       ? computeCapLimit(freshTotalAssets, onchainCapWad)
-      : targetAmount;
-    const capLimit = onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
+      : undefined;
+    if (bandPlan !== undefined) {
+      // bands mode: the reconciled leg is the plan authority — the controller sized the
+      // target against the pinned cap with headroom already, so only the LIVE cap may
+      // shrink the allocate here (see bandsAllocateCeiling for why not the target again).
+      const targetAmount = bandPlan.targetAmounts[a.marketIndex];
+      const liveCapWithHeadroom = onchainCapLimit === undefined
+        ? undefined
+        : onchainCapLimit - onchainCapLimit * CAP_HEADROOM_BPS / 10000n;
+      const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+        targetAmount,
+        pinnedAssets: bandPlan.pinnedPerMarketAssets[a.marketIndex],
+        freshExpected: freshExpectedByIndex.get(a.marketIndex)!,
+        liveCapWithHeadroom,
+      });
+      return { marketIndex: a.marketIndex, market, effectiveCap: ceiling, onchainCapWad, targetAmount, clamped: clampedByLiveCap };
+    }
+    // bps mode (decision-identical rollback): the bps target recomputed against fresh
+    // totalAssets, clamped to the live cap, with headroom on the result — as before.
+    const targetAmount = freshEffectiveTargets[a.marketIndex];
+    const capLimit = onchainCapLimit !== undefined && onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
     const effectiveCap = capLimit - capLimit * CAP_HEADROOM_BPS / 10000n;
     return {
       marketIndex: a.marketIndex,
@@ -1058,7 +1072,7 @@ async function main() {
       effectiveCap,
       onchainCapWad,
       targetAmount,
-      clamped: onchainCapLimit < targetAmount,
+      clamped: onchainCapLimit !== undefined && onchainCapLimit < targetAmount,
     };
   });
 
