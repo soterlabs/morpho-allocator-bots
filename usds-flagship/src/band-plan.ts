@@ -6,6 +6,7 @@
  */
 
 import type { BandConfig } from './band-config.js';
+import { withCapHeadroom } from './allocation-logic.js';
 import type { BandDecision, MarketObservation } from './band-controller.js';
 import { computeMarketCap, type MarketConfig } from './market-config.js';
 import { computeEffectiveMarketCap } from './optimizer-logic.js';
@@ -15,15 +16,21 @@ import type { ReconcileMarket } from './reconcile.js';
  * The two caps a bands-mode observation carries, on one totalAssets snapshot:
  *   marketCap    — the env cap (computeMarketCap); the breach line. Undefined for a
  *                  market with no env cap.
- *   effectiveCap — the deposit ceiling: marketCap further clamped by the on-chain
- *                  relative cap (with headroom), which the vault enforces on allocate;
- *                  just the on-chain bound when there is no env cap.
+ *   effectiveCap — the deposit ceiling: the smaller of marketCap and the on-chain
+ *                  relative cap, each less CAP_HEADROOM_BPS; just the on-chain bound
+ *                  when there is no env cap. The env cap needs the headroom too: it
+ *                  mirrors an on-chain absolute cap, and the vault checks an allocate
+ *                  against the position WITH the interest accrued since the pinned
+ *                  block, so a fill to the exact cap lands over it and reverts every
+ *                  cycle. The breach line stays at marketCap: 1 bps is far under the
+ *                  priority-withdrawal minimum, so a fill never triggers a drain.
  */
 export function bandsCaps(
   market: MarketConfig, totalAssets: bigint, relativeCapWad: bigint,
 ): { marketCap?: bigint; effectiveCap: bigint } {
   const marketCap = computeMarketCap(market, totalAssets);
-  return { marketCap, effectiveCap: computeEffectiveMarketCap(totalAssets, relativeCapWad, marketCap) };
+  const depositCap = marketCap === undefined ? undefined : withCapHeadroom(marketCap);
+  return { marketCap, effectiveCap: computeEffectiveMarketCap(totalAssets, relativeCapWad, depositCap) };
 }
 
 /**

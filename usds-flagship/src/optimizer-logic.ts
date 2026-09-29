@@ -7,7 +7,7 @@
  */
 import { Market, MarketParams } from '@morpho-org/blue-sdk';
 import type { Address } from 'viem';
-import { capDeallocationsToLiquidity, computeAllocationBudget, capAllocationsToBudget, computeCapLimit, CAP_HEADROOM_BPS, type MarketLiquidity, type AllocationAction } from './allocation-logic.js';
+import { capDeallocationsToLiquidity, computeAllocationBudget, capAllocationsToBudget, computeCapLimit, withCapHeadroom, type MarketLiquidity, type AllocationAction } from './allocation-logic.js';
 
 const WAD = 1_000_000_000_000_000_000n;
 
@@ -313,11 +313,12 @@ export function computeVaultApy(
 /**
  * Effective deposit ceiling for one market: the on-chain relative-cap limit with
  * CAP_HEADROOM_BPS headroom, further clamped by the bot-side cap when one is
- * configured (the bps mode's absoluteCap, the bands mode's marketCap).
+ * configured (the bps mode's absoluteCap as is; the bands mode's marketCap already
+ * less its own headroom, see bandsCaps).
  */
 export function computeEffectiveMarketCap(totalAssets: bigint, relativeCapWad: bigint, offChainCap?: bigint): bigint {
   const capLimit = computeCapLimit(totalAssets, relativeCapWad);
-  const withHeadroom = capLimit - (capLimit * CAP_HEADROOM_BPS) / 10000n;
+  const withHeadroom = withCapHeadroom(capLimit);
   return offChainCap !== undefined && offChainCap < withHeadroom ? offChainCap : withHeadroom;
 }
 

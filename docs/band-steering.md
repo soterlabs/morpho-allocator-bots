@@ -93,8 +93,12 @@ falls back to `PT_SUSDS_ABSOLUTE_CAP_USDS` (its bps-mode cap) when only
 `CAP_PTSUSDS_BPS` is set. On the cycle's pinned snapshot:
 
 - `marketCap` = the smaller of the caps set — the breach line.
-- `effectiveCap = min(on-chain relative cap − 1 bps headroom, marketCap)` —
-  the deposit ceiling; band targets and the PRIMARY fill clamp to it.
+- `effectiveCap = min(on-chain relative cap, marketCap) − 1 bps headroom` —
+  the deposit ceiling; band targets and the PRIMARY fill clamp to it. The
+  headroom applies to the env cap too: the vault checks an allocate against
+  the position *with* the interest accrued since the pinned block, so a fill
+  to the exact cap it mirrors (PT-sUSDS's 5M absolute cap) would land over
+  it and revert every cycle.
 
 The on-chain relative cap only clamps deposits; it never triggers a drain.
 

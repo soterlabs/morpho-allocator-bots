@@ -65,10 +65,25 @@ describe('bandsCaps', () => {
     expect(caps.effectiveCap).toBe(ONCHAIN_BOUND);
   });
 
-  it('lets the env cap bound deposits when it is below the on-chain relative cap', () => {
+  it('lets the env cap, less the 1 bps headroom, bound deposits when it is below the on-chain relative cap', () => {
     const caps = bandsCaps(marketConfig({ capUsds: parseEther('3000000') }), TOTAL_ASSETS, RELATIVE_CAP_10_PERCENT_WAD);
     expect(caps.marketCap).toBe(parseEther('3000000'));
-    expect(caps.effectiveCap).toBe(parseEther('3000000'));
+    expect(caps.effectiveCap).toBe(parseEther('2999700'));
+  });
+
+  it('stops a fill 1 bps under an env cap that mirrors the on-chain absolute cap (5M -> 4,999,500)', () => {
+    // TVL 60M: the 10% relative cap (6M) sits above PT-sUSDS's 5M absolute cap, so the
+    // env cap binds. Exactly on it, the allocate would land over the on-chain absolute
+    // cap by the interest accrued since the pinned block and revert every cycle.
+    const caps = bandsCaps(marketConfig({ capUsds: parseEther('5000000') }), parseEther('60000000'), RELATIVE_CAP_10_PERCENT_WAD);
+    expect(caps.marketCap).toBe(parseEther('5000000'));
+    expect(caps.effectiveCap).toBe(parseEther('4999500'));
+  });
+
+  it('keeps a zero cap at a zero deposit ceiling', () => {
+    const caps = bandsCaps(marketConfig({ capUsds: 0n }), TOTAL_ASSETS, RELATIVE_CAP_10_PERCENT_WAD);
+    expect(caps.marketCap).toBe(0n);
+    expect(caps.effectiveCap).toBe(0n);
   });
 
   it('reports marketCap = min(capUsds, capBps x totalAssets) when the share binds', () => {

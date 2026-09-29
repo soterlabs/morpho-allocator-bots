@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, maxWithdrawableWithReserve, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem, bandsAllocateCeiling } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, withCapHeadroom, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, maxWithdrawableWithReserve, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem, bandsAllocateCeiling } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
@@ -15,6 +15,16 @@ function input(overrides: Partial<AllocationInput> & Pick<AllocationInput, 'tota
 }
 
 const eth = parseEther;
+
+describe('withCapHeadroom', () => {
+  it('shaves 1 bps off a cap (5M -> 4,999,500)', () => {
+    expect(withCapHeadroom(parseEther('5000000'))).toBe(parseEther('4999500'));
+  });
+
+  it('leaves a zero cap at zero', () => {
+    expect(withCapHeadroom(0n)).toBe(0n);
+  });
+});
 
 describe('computeCapLimit', () => {
   it('replicates vault mulDivDown(totalAssets, relativeCap, WAD)', () => {

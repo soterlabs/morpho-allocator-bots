@@ -77,8 +77,9 @@ execution. Every STEERED or PRIMARY market must set an amount cap
 (`CAP_<MARKET>_USDS`, falling back to `PT_SUSDS_ABSOLUTE_CAP_USDS` for
 PT-sUSDS) and/or a share cap (`CAP_<MARKET>_BPS`) — the bot refuses to start
 with neither; RETIRED markets need none. The cap is the smaller of those set,
-on the cycle's pinned snapshot, and deposits are additionally clamped by the
-on-chain relative cap (with the 1 bps headroom). The on-chain
+on the cycle's pinned snapshot; deposits stop 1 bps under the smaller of it
+and the on-chain relative cap (the vault checks an allocate against the
+position with accrued interest, so a fill to the exact cap would revert). The on-chain
 cap never triggers a drain — only the env cap does: a STEERED or PRIMARY position above
 its cap by at least `MIN_PRIORITY_WITHDRAWAL_USDS` ($50k; the 100 USDS dust
 floor when the cap is 0, which drains the market down to it) becomes a

@@ -65,7 +65,7 @@ export interface MarketObservation {
   // Undefined when the market has no env cap: then only the on-chain relative cap
   // bounds its deposits, and it never emits a priority withdrawal.
   marketCap?: bigint;
-  // Deposit ceiling this cycle: min(on-chain relative cap with headroom, marketCap).
+  // Deposit ceiling this cycle: min(on-chain relative cap, marketCap), each less the 1 bps headroom.
   effectiveCap: bigint;
   lastAllocateAtSec?: number; lastDeallocateAtSec?: number; // undefined = none in lookback window
 }

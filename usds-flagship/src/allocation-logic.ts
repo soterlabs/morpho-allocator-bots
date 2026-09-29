@@ -14,6 +14,17 @@ const WAD = 1_000_000_000_000_000_000n; // 1e18
 export const CAP_HEADROOM_BPS = 1n;
 
 /**
+ * A cap less CAP_HEADROOM_BPS: the ceiling a deposit may land on. The vault checks
+ * every allocate against the position INCLUDING the interest accrued since the bot's
+ * pinned read, so a target sitting exactly on a cap is over it by the time the tx
+ * lands. The same headroom applies to the on-chain relative cap and to an env cap
+ * that mirrors an on-chain absolute cap (PT-sUSDS's 5M).
+ */
+export function withCapHeadroom(cap: bigint): bigint {
+  return cap - (cap * CAP_HEADROOM_BPS) / 10000n;
+}
+
+/**
  * Percentage of pool supply reserved as a liquidity cushion when deallocating.
  * Prevents the bot from pushing market utilization too high.
  * Default 5% means we leave at least 5% of the pool's totalSupply as idle liquidity.
@@ -44,9 +55,9 @@ export const FLOOR_LANDING_MARGIN_USDS = 100n * 10n ** 18n;
  * ceiling − freshExpected, so the ceiling is the plan target shifted onto the fresh
  * position (the leg itself, whatever interest accrued since the pinned block), bounded
  * by the live on-chain cap with headroom. The controller already applied CAP_HEADROOM_BPS
- * to the pinned cap when it sized the target; applying it again to the target would
- * shrink every allocate by 1 bps of the TARGET (400 USDS on a 4M target) and break a
- * floor-landing plan in the batch guard.
+ * to both pinned caps (on-chain relative and env) when it sized the target; applying
+ * it again to the target would shrink every allocate by 1 bps of the TARGET (400 USDS
+ * on a 4M target) and break a floor-landing plan in the batch guard.
  */
 export function bandsAllocateCeiling(args: {
   targetAmount: bigint;
