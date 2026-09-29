@@ -1085,6 +1085,57 @@ describe('bandsAllocateCeiling', () => {
     expect(ceiling).toBe(TARGET);
     expect(clampedByLiveCap).toBe(false);
   });
+
+  it('shrinks the leg to the live absolute cap with headroom when it sits below the shifted target', () => {
+    // The curator lowered PT-sUSDS's 5M absolute cap to 3.5M (no timelock): 3,499,650 with headroom.
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('4500000'), liveAbsoluteCapWithHeadroom: parseEther('3499650'),
+    });
+
+    expect(ceiling).toBe(parseEther('3499650'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('never clamps on an unlimited absolute cap (2^128 - 1)', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('4500000'), liveAbsoluteCapWithHeadroom: 2n ** 128n - 1n,
+    });
+
+    expect(ceiling).toBe(TARGET);
+    expect(clampedByLiveCap).toBe(false);
+  });
+
+  it('lets the smaller of the two live caps bound the ceiling', () => {
+    // Both below the 4M shifted target; the relative cap (3.6M) is the tighter one.
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('3600000'), liveAbsoluteCapWithHeadroom: parseEther('3800000'),
+    });
+
+    expect(ceiling).toBe(parseEther('3600000'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('yields a zero ceiling when the live absolute cap is zero (market closed to deposits)', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('4500000'), liveAbsoluteCapWithHeadroom: 0n,
+    });
+
+    expect(ceiling).toBe(0n);
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('bounds by the relative cap alone when no absolute cap is passed', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED, liveCapWithHeadroom: parseEther('3800000'),
+    });
+
+    expect(ceiling).toBe(parseEther('3800000'));
+    expect(clampedByLiveCap).toBe(true);
+  });
 });
 
 describe('planAllocations', () => {
@@ -1186,6 +1237,63 @@ describe('capAllocationsToBudget', () => {
     const out = capAllocationsToBudget(allocs, eth('500'), MIN);
     expect(out.map(a => a.marketIndex)).toEqual([1]);
     expect(out[0].amount).toBeLessThanOrEqual(eth('500'));
+  });
+
+  // Bands mode: cbBTC and wstETH band wishes plus PT-sUSDS's PRIMARY fill, 3M in all.
+  const PRIMARY = 2;
+  const WISHES = [
+    { marketIndex: 0, amount: eth('900000') },
+    { marketIndex: 1, amount: eth('600000') },
+    { marketIndex: PRIMARY, amount: eth('1500000') },
+  ];
+
+  it('funds PRIMARY in full and scales the others into the budget left over', () => {
+    // 2M of budget: PRIMARY takes its 1.5M, the 500k left is split 900:600 between the others.
+    const out = capAllocationsToBudget(WISHES, eth('2000000'), MIN, PRIMARY);
+
+    expect(out).toEqual([
+      { marketIndex: 0, amount: eth('300000') },
+      { marketIndex: 1, amount: eth('200000') },
+      { marketIndex: PRIMARY, amount: eth('1500000') },
+    ]);
+  });
+
+  it('gives PRIMARY the whole budget and the others nothing when it wants more than the budget', () => {
+    const out = capAllocationsToBudget(WISHES, eth('1000000'), MIN, PRIMARY);
+
+    expect(out).toEqual([{ marketIndex: PRIMARY, amount: eth('1000000') }]);
+  });
+
+  it('passes allocations through unchanged when they fit the budget, whatever the priority', () => {
+    const out = capAllocationsToBudget(WISHES, eth('5000000'), MIN, PRIMARY);
+
+    expect(out).toEqual(WISHES);
+  });
+
+  it('drops a non-priority allocation the carve scales below the dust floor', () => {
+    // PRIMARY takes 1.5M of a 1,500,200 budget; of the 200 left cbBTC gets 120, wstETH 80 (< 100 min).
+    const out = capAllocationsToBudget(WISHES, eth('1500200'), MIN, PRIMARY);
+
+    expect(out).toEqual([
+      { marketIndex: 0, amount: eth('120') },
+      { marketIndex: PRIMARY, amount: eth('1500000') },
+    ]);
+  });
+
+  it('scales every allocation pro rata when no priority index is given', () => {
+    // Same wishes and budget as the PRIMARY carve: a 2/3 scale for everyone, PRIMARY included.
+    const out = capAllocationsToBudget(WISHES, eth('2000000'), MIN);
+
+    expect(out).toEqual([
+      { marketIndex: 0, amount: eth('600000') },
+      { marketIndex: 1, amount: eth('400000') },
+      { marketIndex: PRIMARY, amount: eth('1000000') },
+    ]);
+  });
+
+  it('returns nothing on a non-positive budget even with a priority index', () => {
+    expect(capAllocationsToBudget(WISHES, 0n, MIN, PRIMARY)).toEqual([]);
+    expect(capAllocationsToBudget(WISHES, -5n, MIN, PRIMARY)).toEqual([]);
   });
 });
 

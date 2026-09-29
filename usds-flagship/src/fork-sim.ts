@@ -416,7 +416,8 @@ function planCycle(s: Snapshot): { decisions: BandDecision[]; calls: PlannedCall
   const adapterCap = adapterCapLimit - adapterCapLimit * CAP_HEADROOM_BPS / 10000n;
   const budget = computeAllocationBudget(adapterCap, s.adapterAssets, totalDeallocated);
   const growWishes = legs.filter(l => l.delta > 0n).map(l => ({ marketIndex: l.index, amount: l.delta }));
-  const grows = capAllocationsToBudget(growWishes, budget, cfg.minBandActionUsds);
+  const primaryIndex = markets.findIndex(m => m.mode === 'PRIMARY');
+  const grows = capAllocationsToBudget(growWishes, budget, cfg.minBandActionUsds, primaryIndex >= 0 ? primaryIndex : undefined);
   const wishedGrow = growWishes.reduce((sum, g) => sum + g.amount, 0n);
   const grantedGrow = grows.reduce((sum, g) => sum + g.amount, 0n);
   if (grantedGrow < wishedGrow) {

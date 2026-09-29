@@ -45,11 +45,12 @@ export interface MarketConfig {
   absoluteCap?: bigint;
   // Bands-mode caps from CAP_<MARKET>_USDS (whole USDS) and CAP_<MARKET>_BPS (share of
   // totalAssets) — off-chain mirrors of the vault's caps, same semantics as the bps mode's
-  // absoluteCap: the bot never reads the on-chain absolute cap, and a breach of these (not
-  // of the on-chain relative cap) is what triggers a priority withdrawal. Every non-RETIRED
-  // market must set at least one in bands mode (validateBandsMarkets), so the breach line
-  // is always a conscious operator choice; only a RETIRED market may have neither. 0 means
-  // "hold nothing" — drained down to the dust floor.
+  // absoluteCap: the executor reads the on-chain absolute cap only as a live deposit
+  // ceiling, and a breach of these (not of either on-chain cap) is what triggers a priority
+  // withdrawal. Every non-RETIRED market must set at least one in bands mode
+  // (validateBandsMarkets), so the breach line is always a conscious operator choice; only
+  // a RETIRED market may have neither. 0 means "hold nothing" — drained down to the dust
+  // floor.
   capUsds?: bigint;
   capBps?: number;
   // When true, this market absorbs an equal share of overflow from absolute-capped markets on

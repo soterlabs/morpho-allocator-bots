@@ -82,9 +82,10 @@ A priority withdrawal skips all of this — see below.
 
 ## Market caps
 
-Same semantics as `bps` mode: caps live off-chain in env (the bot never
-reads the on-chain absolute cap), and the on-chain relative cap is read only
-to clamp allocations at execution. Every STEERED or PRIMARY market **must**
+Same semantics as `bps` mode: caps live off-chain in env, and the on-chain
+relative and absolute caps are read only to clamp allocations at execution
+(a curator or sentinel can lower the absolute cap with no timelock, so the
+env mirror may lag it). Every STEERED or PRIMARY market **must**
 set at least one of an amount cap (`CAP_<MARKET>_USDS`, whole USDS) and a
 share cap (`CAP_<MARKET>_BPS`, bps of totalAssets) — the bot refuses to start
 otherwise, so a market's breach line is always a conscious choice. Only a

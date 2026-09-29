@@ -72,8 +72,8 @@ monopolist share gate, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
 (REQUIRED in bands mode), SSR sanity bounds [1%, 15%].
 
 **Market caps.** Same semantics as `bps` mode: the bot keeps caps off-chain
-in env and reads the on-chain relative cap only to clamp allocations at
-execution. Every STEERED or PRIMARY market must set an amount cap
+in env and reads the on-chain relative and absolute caps only to clamp
+allocations at execution. Every STEERED or PRIMARY market must set an amount cap
 (`CAP_<MARKET>_USDS`, falling back to `PT_SUSDS_ABSOLUTE_CAP_USDS` for
 PT-sUSDS) and/or a share cap (`CAP_<MARKET>_BPS`) — the bot refuses to start
 with neither; RETIRED markets need none. The cap is the smaller of those set,

@@ -54,10 +54,11 @@ export const FLOOR_LANDING_MARGIN_USDS = 100n * 10n ** 18n;
  * Deposit ceiling the executor sizes a bands-mode allocate against. planAllocations sends
  * ceiling − freshExpected, so the ceiling is the plan target shifted onto the fresh
  * position (the leg itself, whatever interest accrued since the pinned block), bounded
- * by the live on-chain cap with headroom. The controller already applied CAP_HEADROOM_BPS
- * to both pinned caps (on-chain relative and env) when it sized the target; applying
- * it again to the target would shrink every allocate by 1 bps of the TARGET (400 USDS
- * on a 4M target) and break a floor-landing plan in the batch guard.
+ * by the live on-chain relative and absolute caps, each with headroom. The controller
+ * already applied CAP_HEADROOM_BPS to both pinned caps (on-chain relative and env) when
+ * it sized the target; applying it again to the target would shrink every allocate by
+ * 1 bps of the TARGET (400 USDS on a 4M target) and break a floor-landing plan in the
+ * batch guard.
  */
 export function bandsAllocateCeiling(args: {
   targetAmount: bigint;
@@ -65,11 +66,19 @@ export function bandsAllocateCeiling(args: {
   freshExpected: bigint;
   /** Live relative-cap limit with headroom; undefined when the vault reports no cap. */
   liveCapWithHeadroom?: bigint;
+  /**
+   * Live absolute cap with headroom. The env cap only mirrors it, and a curator or
+   * sentinel can lower it with no timelock, so the mirror may be stale: without this
+   * bound the allocate reverts and takes the whole batch down every cycle. 2^128 − 1
+   * (unlimited) never binds; 0 yields a zero ceiling, a routine skip-atcap.
+   */
+  liveAbsoluteCapWithHeadroom?: bigint;
 }): { ceiling: bigint; clampedByLiveCap: boolean } {
-  const { targetAmount, pinnedAssets, freshExpected, liveCapWithHeadroom } = args;
+  const { targetAmount, pinnedAssets, freshExpected, liveCapWithHeadroom, liveAbsoluteCapWithHeadroom } = args;
   const shifted = targetAmount + (freshExpected - pinnedAssets);
-  const clampedByLiveCap = liveCapWithHeadroom !== undefined && liveCapWithHeadroom < shifted;
-  return { ceiling: clampedByLiveCap ? liveCapWithHeadroom : shifted, clampedByLiveCap };
+  const liveCaps = [liveCapWithHeadroom, liveAbsoluteCapWithHeadroom].filter((cap): cap is bigint => cap !== undefined);
+  const ceiling = liveCaps.reduce((min, cap) => (cap < min ? cap : min), shifted);
+  return { ceiling, clampedByLiveCap: ceiling < shifted };
 }
 
 export interface AllocationAction {
@@ -461,6 +470,11 @@ export function planAllocations(items: AllocatePlanItem[], minAmount: bigint): A
  * scaled down proportionally to its share of the total, and any result below minAmount is
  * dropped as dust. A non-positive budget (adapter already at/over cap) yields no
  * allocations — the bot just deallocates this cycle and grows next cycle as room frees up.
+ *
+ * With a priorityIndex (bands mode's PRIMARY market) that market is funded first, up to
+ * the whole budget, and only the others are scaled into what is left: reconciliation
+ * serves PRIMARY before the band wishes, and a pro-rata cut here would undo that while
+ * STEERED markets still receive funds.
  */
 /**
  * Room available for new allocations this cycle under the vault's AGGREGATE adapter cap.
@@ -485,12 +499,24 @@ export function capAllocationsToBudget(
   allocations: { marketIndex: number; amount: bigint }[],
   budget: bigint,
   minAmount: bigint,
+  priorityIndex?: number,
 ): { marketIndex: number; amount: bigint }[] {
   if (budget <= 0n) return [];
   const total = allocations.reduce((sum, a) => sum + a.amount, 0n);
   if (total <= budget) return allocations;
+  const priorityWish = allocations.find(a => a.marketIndex === priorityIndex)?.amount ?? 0n;
+  const priorityAmount = priorityWish < budget ? priorityWish : budget;
+  // Without a priority market this is the plain pro-rata scale, the whole budget over the
+  // whole total. Floor division keeps the sum at or under the budget either way.
+  const othersBudget = budget - priorityAmount;
+  const othersTotal = total - priorityWish;
   return allocations
-    .map(a => ({ marketIndex: a.marketIndex, amount: (a.amount * budget) / total }))
+    .map(a => ({
+      marketIndex: a.marketIndex,
+      amount: a.marketIndex === priorityIndex
+        ? priorityAmount
+        : othersTotal === 0n ? 0n : (a.amount * othersBudget) / othersTotal,
+    }))
     .filter(a => a.amount >= minAmount);
 }
 
