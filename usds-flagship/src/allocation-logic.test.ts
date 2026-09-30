@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, withCapHeadroom, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, computeEffectiveTargetAmounts, maxWithdrawableForUtilization, maxWithdrawableWithReserve, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem, bandsAllocateCeiling } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
@@ -15,6 +15,16 @@ function input(overrides: Partial<AllocationInput> & Pick<AllocationInput, 'tota
 }
 
 const eth = parseEther;
+
+describe('withCapHeadroom', () => {
+  it('shaves 1 bps off a cap (5M -> 4,999,500)', () => {
+    expect(withCapHeadroom(parseEther('5000000'))).toBe(parseEther('4999500'));
+  });
+
+  it('leaves a zero cap at zero', () => {
+    expect(withCapHeadroom(0n)).toBe(0n);
+  });
+});
 
 describe('computeCapLimit', () => {
   it('replicates vault mulDivDown(totalAssets, relativeCap, WAD)', () => {
@@ -1034,6 +1044,100 @@ describe('planDeallocations', () => {
 // ============================================================
 // planAllocations — gap-to-cap with dust floor and at-cap distinction
 // ============================================================
+describe('bandsAllocateCeiling', () => {
+  // A 4M PT-sUSDS target reached from a 3M pinned position: the leg is 1M.
+  const TARGET = parseEther('4000000');
+  const PINNED = parseEther('3000000');
+
+  it('sends exactly the leg when nothing moved since the pinned block', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED, liveCapWithHeadroom: parseEther('4500000'),
+    });
+
+    expect(ceiling - PINNED).toBe(parseEther('1000000'));
+    expect(clampedByLiveCap).toBe(false);
+  });
+
+  it('keeps the leg whole when the fresh position carries accrued interest', () => {
+    // 3,000,050 fresh: the ceiling shifts by the 50 USDS of interest so the gap is still 1M.
+    const fresh = PINNED + parseEther('50');
+    const { ceiling } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: fresh, liveCapWithHeadroom: parseEther('4500000'),
+    });
+
+    expect(ceiling - fresh).toBe(parseEther('1000000'));
+  });
+
+  it('shrinks the leg only when the live cap sits below the shifted target', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED, liveCapWithHeadroom: parseEther('3800000'),
+    });
+
+    expect(ceiling).toBe(parseEther('3800000'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('uses the shifted target alone when the vault reports no live cap', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+    });
+
+    expect(ceiling).toBe(TARGET);
+    expect(clampedByLiveCap).toBe(false);
+  });
+
+  it('shrinks the leg to the live absolute cap with headroom when it sits below the shifted target', () => {
+    // The curator lowered PT-sUSDS's 5M absolute cap to 3.5M (no timelock): 3,499,650 with headroom.
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('4500000'), liveAbsoluteCapWithHeadroom: parseEther('3499650'),
+    });
+
+    expect(ceiling).toBe(parseEther('3499650'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('never clamps on an unlimited absolute cap (2^128 - 1)', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('4500000'), liveAbsoluteCapWithHeadroom: 2n ** 128n - 1n,
+    });
+
+    expect(ceiling).toBe(TARGET);
+    expect(clampedByLiveCap).toBe(false);
+  });
+
+  it('lets the smaller of the two live caps bound the ceiling', () => {
+    // Both below the 4M shifted target; the relative cap (3.6M) is the tighter one.
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('3600000'), liveAbsoluteCapWithHeadroom: parseEther('3800000'),
+    });
+
+    expect(ceiling).toBe(parseEther('3600000'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('yields a zero ceiling when the live absolute cap is zero (market closed to deposits)', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED,
+      liveCapWithHeadroom: parseEther('4500000'), liveAbsoluteCapWithHeadroom: 0n,
+    });
+
+    expect(ceiling).toBe(0n);
+    expect(clampedByLiveCap).toBe(true);
+  });
+
+  it('bounds by the relative cap alone when no absolute cap is passed', () => {
+    const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+      targetAmount: TARGET, pinnedAssets: PINNED, freshExpected: PINNED, liveCapWithHeadroom: parseEther('3800000'),
+    });
+
+    expect(ceiling).toBe(parseEther('3800000'));
+    expect(clampedByLiveCap).toBe(true);
+  });
+});
+
 describe('planAllocations', () => {
   const MIN = eth('100');
   const item = (marketIndex: number, effectiveCap: bigint, freshExpected: bigint): AllocatePlanItem => ({ marketIndex, effectiveCap, freshExpected });
@@ -1133,6 +1237,63 @@ describe('capAllocationsToBudget', () => {
     const out = capAllocationsToBudget(allocs, eth('500'), MIN);
     expect(out.map(a => a.marketIndex)).toEqual([1]);
     expect(out[0].amount).toBeLessThanOrEqual(eth('500'));
+  });
+
+  // Bands mode: cbBTC and wstETH band wishes plus PT-sUSDS's PRIMARY fill, 3M in all.
+  const PRIMARY = 2;
+  const WISHES = [
+    { marketIndex: 0, amount: eth('900000') },
+    { marketIndex: 1, amount: eth('600000') },
+    { marketIndex: PRIMARY, amount: eth('1500000') },
+  ];
+
+  it('funds PRIMARY in full and scales the others into the budget left over', () => {
+    // 2M of budget: PRIMARY takes its 1.5M, the 500k left is split 900:600 between the others.
+    const out = capAllocationsToBudget(WISHES, eth('2000000'), MIN, PRIMARY);
+
+    expect(out).toEqual([
+      { marketIndex: 0, amount: eth('300000') },
+      { marketIndex: 1, amount: eth('200000') },
+      { marketIndex: PRIMARY, amount: eth('1500000') },
+    ]);
+  });
+
+  it('gives PRIMARY the whole budget and the others nothing when it wants more than the budget', () => {
+    const out = capAllocationsToBudget(WISHES, eth('1000000'), MIN, PRIMARY);
+
+    expect(out).toEqual([{ marketIndex: PRIMARY, amount: eth('1000000') }]);
+  });
+
+  it('passes allocations through unchanged when they fit the budget, whatever the priority', () => {
+    const out = capAllocationsToBudget(WISHES, eth('5000000'), MIN, PRIMARY);
+
+    expect(out).toEqual(WISHES);
+  });
+
+  it('drops a non-priority allocation the carve scales below the dust floor', () => {
+    // PRIMARY takes 1.5M of a 1,500,200 budget; of the 200 left cbBTC gets 120, wstETH 80 (< 100 min).
+    const out = capAllocationsToBudget(WISHES, eth('1500200'), MIN, PRIMARY);
+
+    expect(out).toEqual([
+      { marketIndex: 0, amount: eth('120') },
+      { marketIndex: PRIMARY, amount: eth('1500000') },
+    ]);
+  });
+
+  it('scales every allocation pro rata when no priority index is given', () => {
+    // Same wishes and budget as the PRIMARY carve: a 2/3 scale for everyone, PRIMARY included.
+    const out = capAllocationsToBudget(WISHES, eth('2000000'), MIN);
+
+    expect(out).toEqual([
+      { marketIndex: 0, amount: eth('600000') },
+      { marketIndex: 1, amount: eth('400000') },
+      { marketIndex: PRIMARY, amount: eth('1000000') },
+    ]);
+  });
+
+  it('returns nothing on a non-positive budget even with a priority index', () => {
+    expect(capAllocationsToBudget(WISHES, 0n, MIN, PRIMARY)).toEqual([]);
+    expect(capAllocationsToBudget(WISHES, -5n, MIN, PRIMARY)).toEqual([]);
   });
 });
 
@@ -1264,6 +1425,33 @@ describe('maxWithdrawableForUtilization', () => {
     const w = maxWithdrawableForUtilization(supply, borrow, 9300);
     expect(w).toBeGreaterThan(0n);
     expect(w).toBeLessThan(supply - borrow); // less than the full 200 idle
+  });
+});
+
+describe('maxWithdrawableWithReserve', () => {
+  // cbBTC/USDS-like pool: 4.2M supply, 3.72M borrow -> 480k idle; a 5% reserve is 210k.
+  const SUPPLY = eth('4200000');
+
+  it('returns idle liquidity minus the reserve', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('3720000'), 5n)).toBe(eth('270000'));
+  });
+
+  it('returns 0 when the reserve exceeds idle liquidity', () => {
+    // 150k idle < 210k reserve.
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('4050000'), 5n)).toBe(0n);
+  });
+
+  it('returns 0 when idle liquidity exactly equals the reserve', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('3990000'), 5n)).toBe(0n);
+  });
+
+  it('returns 0 when borrows reach or exceed supply', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, SUPPLY, 5n)).toBe(0n);
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('4200001'), 5n)).toBe(0n);
+  });
+
+  it('returns the full idle liquidity with a 0% reserve', () => {
+    expect(maxWithdrawableWithReserve(SUPPLY, eth('3720000'), 0n)).toBe(eth('480000'));
   });
 });
 

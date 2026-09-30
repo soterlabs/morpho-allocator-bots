@@ -24,7 +24,7 @@
  * Transactions are executed through a Safe 1/3 multisig. The bot is one of the 3 signers
  * and can execute autonomously since the threshold is 1.
  *
- * Run as a Railway cron service every 20 minutes (cronSchedule in railway.toml).
+ * Run as a Railway cron service every hour (cronSchedule in railway.toml).
  *
  * Environment Variables (see .env.example):
  *   - ALLOCATION_MODE: REQUIRED, 'bps' | 'bands'
@@ -42,15 +42,15 @@ import { mainnet } from 'viem/chains';
 import { createHash } from 'node:crypto';
 import { Market, MarketParams } from '@morpho-org/blue-sdk';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
-import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi, encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId } from './market-config.js';
+import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, withCapHeadroom, DUST_FLOOR_USDS, FLOOR_LANDING_MARGIN_USDS, LIQUIDITY_RESERVE_PERCENT, bandsAllocateCeiling, capDeallocationsToLiquidity, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi, encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId, validateBandsMarkets, validateBpsMarkets } from './market-config.js';
+import { bandsCaps, isDrainToZero, toReconcileMarket } from './band-plan.js';
 import { parseBandConfig, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
 import { computeBandDecisions, type MarketObservation, type BandDecision } from './band-controller.js';
 import { reconcileToVaultLimits, type ReconcileMarket } from './reconcile.js';
 import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
 import { simulateAnchor, anchorPerSecWadToApy, postTradeUtilizationWad } from './anchor-sim.js';
 import { fetchActionHistory, type ActionHistoryClient } from './onchain-history.js';
-import { computeEffectiveMarketCap } from './optimizer-logic.js';
 
 // Emergency stop: BOT_PAUSED=true short-circuits the cron cycle cleanly (exit 0)
 // IMMEDIATELY — before RPC_URL/mode/config validation, any of which can throw. The kill
@@ -103,7 +103,7 @@ const config = {
   rebalanceThresholdBps: 10, // 0.1%
 
   // Minimum allocation amount (to avoid dust transactions)
-  minAllocationAmount: parseEther('100'), // 100 USDS minimum
+  minAllocationAmount: DUST_FLOOR_USDS,
 
   // Optional per-market cap on how much to deallocate in a single cycle (USDS). Lets the
   // migration proceed in smaller, gentler steps. 0 (default) means no extra cap — each
@@ -152,6 +152,7 @@ if (allocationMode === 'bps') {
   // deallocation must also have its oracle set (see the m.oracle !== '0x0' filter in
   // main) — e.g. the migration requires ORACLE_WETH so WETH can be drained to 0%.
   validateTargetBpsSum(markets.map(m => ({ label: m.name, bps: m.targetBps })), config.targetAllocatedPercent);
+  validateBpsMarkets(markets);
 
   // Hard-fail when a retired market (targetBps === 0) has no oracle. target-0 means "this
   // market must hold nothing", but without an oracle it can't be addressed or drained, so
@@ -167,17 +168,8 @@ if (allocationMode === 'bps') {
     );
   }
 } else {
-  // Per-market SSR_t margin overrides must respect the same tolerance <= margin
-  // invariant parseBandConfig enforces for the global margin — an override below the
-  // tolerance would put a market's HOLD zone under SSR itself. Refuse to start.
-  const badMargins = markets.filter(
-    m => m.ssrTMarginBps !== undefined && m.ssrTMarginBps < bandConfig!.ssrTToleranceBps);
-  if (badMargins.length > 0) {
-    throw new Error(
-      `${badMargins.map(m => m.name).join(', ')} have SSR_T_MARGIN_<MARKET>_BPS below ` +
-      `SSR_T_TOLERANCE_BPS (${bandConfig!.ssrTToleranceBps}) — the HOLD zone would accept rates below SSR.`
-    );
-  }
+  // At most one PRIMARY market; every STEERED/PRIMARY market has a cap (its breach line).
+  validateBandsMarkets(markets);
 
   // A steered market must be addressable: without an oracle its market id cannot be
   // derived, so it would be silently dropped from the run — never observed, never
@@ -185,7 +177,7 @@ if (allocationMode === 'bps') {
   const unsteerable = markets.filter(m => m.mode !== 'RETIRED' && m.oracle === '0x0');
   if (unsteerable.length > 0) {
     throw new Error(
-      `${unsteerable.map(m => m.name).join(', ')} are STEERED but have no oracle configured — ` +
+      `${unsteerable.map(m => m.name).join(', ')} are not RETIRED but have no oracle configured — ` +
       `set their ORACLE_* env vars or set MODE_<MARKET>=RETIRED.`
     );
   }
@@ -242,6 +234,16 @@ const vaultAbi = [
     // keccak256(abi.encode("collateralToken", collateral)). Used to clamp allocations
     // so we never exceed the on-chain cap (which would revert the whole batch).
     name: 'relativeCap',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'id', type: 'bytes32' }],
+    outputs: [{ type: 'uint256' }],
+  },
+  {
+    // Per-id absolute cap in asset units (2^128 − 1 = unlimited). A curator or sentinel
+    // can lower it with no timelock, so the bands executor clamps allocates to the live
+    // value rather than trusting the env cap that mirrors it.
+    name: 'absoluteCap',
     type: 'function',
     stateMutability: 'view',
     inputs: [{ name: 'id', type: 'bytes32' }],
@@ -483,6 +485,7 @@ async function executeSafeTransaction(
 interface BandPlan {
   targetAmounts: bigint[];              // reconciled absolute vault target per market
   utilByIndex: (number | undefined)[];  // band each drain is held to (withdrawal clamp)
+  drainToZeroByIndex: boolean[];        // zero-cap drains bypass the executor's dust floor
   pinnedTotalAssets: bigint;            // the snapshot the targets were computed from
   pinnedPerMarketAssets: bigint[];
   pinnedBlockNumber: bigint;            // for the pre-execution reorg check
@@ -588,13 +591,15 @@ async function computeBandPlan(
       totalBorrowAssets: accruedMarkets[i].totalBorrowAssets,
       vaultAssets: pinnedPerMarketAssets[i],
       anchorApy: anchorPerSecWadToApy(accruedMarkets[i].rateAtTarget!),
-      effectiveCap: computeEffectiveMarketCap(pinnedTotalAssets, collateralCapsWad[i], m.absoluteCap),
+      ...bandsCaps(m, pinnedTotalAssets, collateralCapsWad[i]),
       lastAllocateAtSec: hist?.lastAllocateAtSec,
       lastDeallocateAtSec: hist?.lastDeallocateAtSec,
     };
   });
 
-  const decisions: BandDecision[] = computeBandDecisions({ markets: observations, cfg, ssrApy, nowSec });
+  const decisions: BandDecision[] = computeBandDecisions({
+    markets: observations, cfg, ssrApy, nowSec, liquidityReservePercent: LIQUIDITY_RESERVE_PERCENT,
+  });
 
   // Re-index decisions by market position, failing loud on gaps or duplicates — a
   // malformed decision vector must never silently leave a market unsteered.
@@ -618,15 +623,8 @@ async function computeBandPlan(
   // room ACTUALLY freed by this batch's deallocations, so a withdrawal shrunk by fresh
   // liquidity cannot push the sleeve past the on-chain cap.)
   const sleeveUsds = visibleAssets;
-  const reconcileInputs: ReconcileMarket[] = configuredMarkets.map((m, i) => ({
-    index: i,
-    name: m.name,
-    delta: decisionByIndex[i].targetAmount - pinnedPerMarketAssets[i],
-    bandUtilBps: decisionByIndex[i].bandUtilBps,
-    totalSupplyAssets: observations[i].totalSupplyAssets,
-    totalBorrowAssets: observations[i].totalBorrowAssets,
-    anchorApy: observations[i].anchorApy,
-  }));
+  const reconcileInputs: ReconcileMarket[] = configuredMarkets.map(
+    (m, i) => toReconcileMarket(m, observations[i], decisionByIndex[i], cfg));
   const legs = reconcileToVaultLimits({
     markets: reconcileInputs,
     sleeveUsds,
@@ -634,6 +632,7 @@ async function computeBandPlan(
     sleeveFloorBps: cfg.sleeveFloorBps,
     sleeveCapBps: config.targetAllocatedPercent,
     minActionUsds: cfg.minBandActionUsds,
+    floorMarginUsds: FLOOR_LANDING_MARGIN_USDS,
   });
 
   // A/B borrower-reaction bracket (LOG-ONLY, no veto): for each market with an
@@ -676,9 +675,12 @@ async function computeBandPlan(
       index: d.index,
       name: observations[d.index].name,
       rule: d.rule,
+      priority: d.priority,
       reasons: d.reasons,
       targetAmount: d.targetAmount,
       bandUtilBps: d.bandUtilBps,
+      marketCap: observations[d.index].marketCap,
+      effectiveCap: observations[d.index].effectiveCap,
     })),
     reconciled: legs.map(leg => ({
       index: leg.index,
@@ -695,15 +697,17 @@ async function computeBandPlan(
 
   const targetAmounts = new Array<bigint>(configuredMarkets.length);
   const utilByIndex = new Array<number | undefined>(configuredMarkets.length);
+  const drainToZeroByIndex = new Array<boolean>(configuredMarkets.length);
   for (const leg of legs) {
     targetAmounts[leg.index] = pinnedPerMarketAssets[leg.index] + leg.delta;
     utilByIndex[leg.index] = decisionByIndex[leg.index].bandUtilBps;
+    drainToZeroByIndex[leg.index] = isDrainToZero(decisionByIndex[leg.index], observations[leg.index]);
   }
   if (block.hash === null) {
     throw new Error('pinned block has no hash — cannot arm the pre-execution reorg check');
   }
   return {
-    targetAmounts, utilByIndex, pinnedTotalAssets, pinnedPerMarketAssets,
+    targetAmounts, utilByIndex, drainToZeroByIndex, pinnedTotalAssets, pinnedPerMarketAssets,
     pinnedBlockNumber: block.number, pinnedBlockHash: block.hash,
   };
 }
@@ -934,10 +938,11 @@ async function main() {
   }
 
   // Compute per-market allocation/deallocation actions.
-  // bands mode never sweeps — an explicit all-false vector, because undefined would
-  // fall back to the legacy "targetBps === 0 means sweep" inference and drain markets
-  // the band decisions chose to leave alone. bps mode keeps the legacy inference.
-  const sweepByIndex = allocationMode === 'bands' ? configuredMarkets.map(() => false) : undefined;
+  // bands mode sweeps only a zero-cap market's drain (it must end holding nothing) — an
+  // explicit vector, because undefined would fall back to the legacy "targetBps === 0
+  // means sweep" inference and drain markets the band decisions chose to leave alone.
+  // bps mode keeps the legacy inference.
+  const sweepByIndex = bandPlan?.drainToZeroByIndex;
   const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
     // bands mode: act on the SAME pinned snapshot the reconciled targets were computed
@@ -984,6 +989,9 @@ async function main() {
   const freshExpectedByIndex = new Map<number, bigint>();
   // On-chain relative cap (WAD) per allocate market's collateral, to clamp allocations.
   const onchainRelativeCapWadByIndex = new Map<number, bigint>();
+  // On-chain absolute cap (asset units) per allocate market's collateral. Only bands mode
+  // uses it, as a live deposit ceiling; the env cap stays the breach line.
+  const onchainAbsoluteCapByIndex = new Map<number, bigint>();
   let freshTotalAssets = totalAssets;
   let freshAdapterAssets = adapterAssets;
   // Effective headroom under the vault's AGGREGATE adapter cap (e.g. 20%), with headroom.
@@ -993,7 +1001,7 @@ async function main() {
   if (allocateActions.length > 0) {
     const allocateMarketIds = allocateActions.map(a => computeMarketId(configuredMarkets[a.marketIndex]));
     const allocateCapIds = allocateActions.map(a => computeCollateralCapId(configuredMarkets[a.marketIndex]));
-    const [freshTotal, freshAdapter, adapterRelativeCapWad, freshExpected, relativeCaps] = await Promise.all([
+    const [freshTotal, freshAdapter, adapterRelativeCapWad, freshExpected, relativeCaps, absoluteCaps] = await Promise.all([
       publicClient.readContract({
         address: config.vaultAddress,
         abi: vaultAbi,
@@ -1026,6 +1034,14 @@ async function main() {
           args: [id],
         }),
       )),
+      Promise.all(allocateCapIds.map(id =>
+        publicClient.readContract({
+          address: config.vaultAddress,
+          abi: vaultAbi,
+          functionName: 'absoluteCap',
+          args: [id],
+        }),
+      )),
     ]);
     freshTotalAssets = freshTotal;
     freshAdapterAssets = freshAdapter;
@@ -1034,6 +1050,7 @@ async function main() {
     allocateActions.forEach((a, i) => {
       freshExpectedByIndex.set(a.marketIndex, freshExpected[i]);
       onchainRelativeCapWadByIndex.set(a.marketIndex, relativeCaps[i]);
+      onchainAbsoluteCapByIndex.set(a.marketIndex, absoluteCaps[i]);
     });
   }
 
@@ -1046,17 +1063,35 @@ async function main() {
   const freshEffectiveTargets = computeEffectiveTargetAmounts(freshTotalAssets, targetSpecs);
   const allocateCapInfo = allocateActions.map(a => {
     const market = configuredMarkets[a.marketIndex];
-    // bands mode: the cap target is the band decision's absolute amount (computed off the
-    // pinned snapshot; step caps and effectiveCap already applied by the controller).
-    // bps mode: the bps target recomputed against fresh totalAssets, as before.
-    const targetAmount = bandPlan !== undefined
-      ? bandPlan.targetAmounts[a.marketIndex]
-      : freshEffectiveTargets[a.marketIndex];
     const onchainCapWad = onchainRelativeCapWadByIndex.get(a.marketIndex);
     const onchainCapLimit = onchainCapWad !== undefined
       ? computeCapLimit(freshTotalAssets, onchainCapWad)
-      : targetAmount;
-    const capLimit = onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
+      : undefined;
+    if (bandPlan !== undefined) {
+      // bands mode: the reconciled leg is the plan authority — the controller sized the
+      // target against the pinned cap with headroom already, so only the LIVE cap may
+      // shrink the allocate here (see bandsAllocateCeiling for why not the target again).
+      const targetAmount = bandPlan.targetAmounts[a.marketIndex];
+      const liveCapWithHeadroom = onchainCapLimit === undefined
+        ? undefined
+        : onchainCapLimit - onchainCapLimit * CAP_HEADROOM_BPS / 10000n;
+      const onchainAbsoluteCap = onchainAbsoluteCapByIndex.get(a.marketIndex);
+      const liveAbsoluteCapWithHeadroom = onchainAbsoluteCap === undefined ? undefined : withCapHeadroom(onchainAbsoluteCap);
+      const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+        targetAmount,
+        pinnedAssets: bandPlan.pinnedPerMarketAssets[a.marketIndex],
+        freshExpected: freshExpectedByIndex.get(a.marketIndex)!,
+        liveCapWithHeadroom,
+        liveAbsoluteCapWithHeadroom,
+      });
+      // Which live cap the ceiling landed on, for the warning below (a tie names the absolute cap).
+      const clampedBy = !clampedByLiveCap ? undefined : ceiling === liveAbsoluteCapWithHeadroom ? 'absolute' : 'relative';
+      return { marketIndex: a.marketIndex, market, effectiveCap: ceiling, onchainCapWad, onchainAbsoluteCap, targetAmount, clamped: clampedByLiveCap, clampedBy };
+    }
+    // bps mode (decision-identical rollback): the bps target recomputed against fresh
+    // totalAssets, clamped to the live cap, with headroom on the result — as before.
+    const targetAmount = freshEffectiveTargets[a.marketIndex];
+    const capLimit = onchainCapLimit !== undefined && onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
     const effectiveCap = capLimit - capLimit * CAP_HEADROOM_BPS / 10000n;
     return {
       marketIndex: a.marketIndex,
@@ -1064,18 +1099,22 @@ async function main() {
       effectiveCap,
       onchainCapWad,
       targetAmount,
-      clamped: onchainCapLimit < targetAmount,
+      clamped: onchainCapLimit !== undefined && onchainCapLimit < targetAmount,
     };
   });
 
-  // Warn when a market's on-chain relative cap is below its target — allocations are
+  // Warn when a market's live on-chain cap is below its target — allocations are
   // clamped to the live cap, so the market can't reach target until the cap is raised.
   for (const info of allocateCapInfo) {
     if (info.clamped) {
       const onchainBps = info.onchainCapWad !== undefined ? Number((info.onchainCapWad * 10000n) / 10n ** 18n) : 0;
-      log(`WARNING: ${info.market.name} on-chain relative cap is ${onchainBps} bps but effective target is ` +
+      // bps mode only ever clamps to the relative cap; bands mode reports which one bound.
+      const [capLine, raiseFn] = info.clampedBy === 'absolute'
+        ? [`on-chain absolute cap is ${formatEther(info.onchainAbsoluteCap!)} USDS`, 'increaseAbsoluteCap']
+        : [`on-chain relative cap is ${onchainBps} bps`, 'increaseRelativeCap'];
+      log(`WARNING: ${info.market.name} ${capLine} but effective target is ` +
           `${formatEther(info.targetAmount)} USDS (${info.market.targetBps} bps base) — allocations are clamped ` +
-          `to the on-chain cap. Raise the cap (increaseRelativeCap) to reach target.`);
+          `to the on-chain cap. Raise the cap (${raiseFn}) to reach target.`);
     }
   }
 
@@ -1191,7 +1230,11 @@ async function main() {
   // adapter is at/over cap the budget is ~0, so the bot just deallocates and grows next cycle.
   const allocationBudget = computeAllocationBudget(adapterAllocationCap, freshAdapterAssets, totalDeallocated);
   const plannedTotal = plannedAllocations.reduce((sum, a) => sum + a.amount, 0n);
-  const budgetedAllocations = capAllocationsToBudget(plannedAllocations, allocationBudget, config.minAllocationAmount);
+  // bands mode funds PRIMARY first: reconciliation served it before the band wishes, and a
+  // pro-rata cut here would hand its budget to STEERED markets. bps mode has no PRIMARY.
+  const primaryIndex = configuredMarkets.findIndex(m => m.mode === 'PRIMARY');
+  const priorityIndex = bandPlan !== undefined && primaryIndex >= 0 ? primaryIndex : undefined;
+  const budgetedAllocations = capAllocationsToBudget(plannedAllocations, allocationBudget, config.minAllocationAmount, priorityIndex);
   if (plannedTotal > allocationBudget) {
     log(`  Allocations limited by adapter cap: wanted ${formatEther(plannedTotal)}, budget ${formatEther(allocationBudget)} (adapter cap ${formatEther(adapterAllocationCap)}, adapter after deallocations ${formatEther(freshAdapterAssets - totalDeallocated)})`);
   }

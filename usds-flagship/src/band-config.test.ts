@@ -9,10 +9,11 @@ const REQUIRED = { MAX_ALLOCATE_USDS: '5000000', MAX_DEALLOCATE_USDS: '5000000' 
 describe('parseBandConfig', () => {
   it('applies the production defaults when only required vars are set', () => {
     const cfg = parseBandConfig(REQUIRED);
-    expect(cfg.ssrTMarginBps).toBe(25);
+    expect(cfg.ssrTMarginBps).toBe(0);
     expect(cfg.ssrTToleranceBps).toBe(25);
     expect(cfg.utilDeadbandBps).toBe(50);
-    expect(cfg.minBandActionUsds).toBe(100_000n * WAD);
+    expect(cfg.minBandActionUsds).toBe(10_000n * WAD);
+    expect(cfg.minPriorityWithdrawalUsds).toBe(50_000n * WAD);
     expect(cfg.sleeveFloorBps).toBe(1500);
     expect(cfg.directionCooldownHours).toBe(24);
     expect(cfg.monopolistShareBps).toBe(8000);
@@ -27,13 +28,59 @@ describe('parseBandConfig', () => {
       ...REQUIRED,
       SSR_T_MARGIN_BPS: '40',
       SSR_T_TOLERANCE_BPS: '30',
-      MIN_BAND_ACTION_USDS: '50000',
+      MIN_BAND_ACTION_USDS: '100000',
       SLEEVE_FLOOR_BPS: '1600',
     });
     expect(cfg.ssrTMarginBps).toBe(40);
     expect(cfg.ssrTToleranceBps).toBe(30);
-    expect(cfg.minBandActionUsds).toBe(50_000n * WAD);
+    expect(cfg.minBandActionUsds).toBe(100_000n * WAD);
     expect(cfg.sleeveFloorBps).toBe(1600);
+  });
+
+  describe('MIN_BAND_ACTION_USDS', () => {
+    it('defaults to 10k USDS (18-dec)', () => {
+      expect(parseBandConfig(REQUIRED).minBandActionUsds).toBe(10_000n * WAD);
+    });
+
+    it('honors an explicit override in whole USDS', () => {
+      const cfg = parseBandConfig({ ...REQUIRED, MIN_BAND_ACTION_USDS: '100000' });
+      expect(cfg.minBandActionUsds).toBe(100_000n * WAD);
+    });
+  });
+
+  describe('MIN_PRIORITY_WITHDRAWAL_USDS', () => {
+    it('defaults to 50k USDS (18-dec)', () => {
+      expect(parseBandConfig(REQUIRED).minPriorityWithdrawalUsds).toBe(50_000n * WAD);
+    });
+
+    it('honors an explicit override in whole USDS', () => {
+      const cfg = parseBandConfig({ ...REQUIRED, MIN_PRIORITY_WITHDRAWAL_USDS: '25000' });
+      expect(cfg.minPriorityWithdrawalUsds).toBe(25_000n * WAD);
+    });
+
+    it('accepts 0 (every breach drains immediately)', () => {
+      expect(parseBandConfig({ ...REQUIRED, MIN_PRIORITY_WITHDRAWAL_USDS: '0' }).minPriorityWithdrawalUsds).toBe(0n);
+    });
+
+    it('rejects non-canonical values instead of defaulting', () => {
+      expect(() => parseBandConfig({ ...REQUIRED, MIN_PRIORITY_WITHDRAWAL_USDS: '50000.5' })).toThrow(/MIN_PRIORITY_WITHDRAWAL_USDS/);
+      expect(() => parseBandConfig({ ...REQUIRED, MIN_PRIORITY_WITHDRAWAL_USDS: '' })).toThrow(/MIN_PRIORITY_WITHDRAWAL_USDS/);
+      expect(() => parseBandConfig({ ...REQUIRED, MIN_PRIORITY_WITHDRAWAL_USDS: '5e4' })).toThrow(/MIN_PRIORITY_WITHDRAWAL_USDS/);
+      expect(() => parseBandConfig({ ...REQUIRED, MIN_PRIORITY_WITHDRAWAL_USDS: '-1' })).toThrow(/MIN_PRIORITY_WITHDRAWAL_USDS/);
+    });
+
+    it('refuses a MAX_DEALLOCATE_USDS step cap below the priority-withdrawal min (breaches could never drain)', () => {
+      // 40k step cap clears the 10k min action but not the 50k priority-withdrawal
+      // default: every cap-breach drain would be clamped under its own drop threshold
+      // and dropped, cycle after cycle.
+      expect(() => parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '40000' }))
+        .toThrow(/MAX_DEALLOCATE_USDS must be >= MIN_PRIORITY_WITHDRAWAL_USDS/);
+    });
+
+    it('accepts a MAX_DEALLOCATE_USDS step cap exactly at the priority-withdrawal min', () => {
+      const cfg = parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '50000' });
+      expect(cfg.maxDeallocateUsds).toBe(cfg.minPriorityWithdrawalUsds);
+    });
   });
 
   describe('required step caps', () => {
@@ -75,13 +122,11 @@ describe('parseBandConfig', () => {
   });
 
   describe('cross-field validation', () => {
-    it('throws when the tolerance exceeds the margin (zone would dip below SSR)', () => {
-      expect(() => parseBandConfig({ ...REQUIRED, SSR_T_TOLERANCE_BPS: '26' })).toThrow(/SSR_T_TOLERANCE_BPS/);
-    });
-
-    it('accepts a tolerance equal to the margin (zone bottoms out exactly at SSR)', () => {
-      const cfg = parseBandConfig({ ...REQUIRED, SSR_T_MARGIN_BPS: '30', SSR_T_TOLERANCE_BPS: '30' });
-      expect(cfg.ssrTToleranceBps).toBe(30);
+    it('accepts a tolerance wider than the margin (the zone may dip below SSR)', () => {
+      // The production shape: margin 0, tolerance 25 -> zone [SSR - 25, SSR + 25] bps.
+      const cfg = parseBandConfig({ ...REQUIRED, SSR_T_MARGIN_BPS: '0', SSR_T_TOLERANCE_BPS: '25' });
+      expect(cfg.ssrTMarginBps).toBe(0);
+      expect(cfg.ssrTToleranceBps).toBe(25);
     });
 
     it('throws when the sleeve floor is not < 2000 bps', () => {
@@ -97,12 +142,20 @@ describe('parseBandConfig', () => {
     });
 
     it('throws when a step cap is below the min action (the bot could never act)', () => {
-      expect(() => parseBandConfig({ ...REQUIRED, MAX_ALLOCATE_USDS: '50000' })).toThrow(/MIN_BAND_ACTION_USDS/);
-      expect(() => parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '99999' })).toThrow(/MIN_BAND_ACTION_USDS/);
+      // 9999 is one USDS under the 10k default on either side.
+      expect(() => parseBandConfig({ ...REQUIRED, MAX_ALLOCATE_USDS: '9999' })).toThrow(/MIN_BAND_ACTION_USDS/);
+      expect(() => parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '9999' })).toThrow(/MIN_BAND_ACTION_USDS/);
     });
 
     it('accepts a step cap equal to the min action', () => {
-      const cfg = parseBandConfig({ ...REQUIRED, MAX_DEALLOCATE_USDS: '100000' });
+      // MAX_ALLOCATE has no other lower bound (MAX_DEALLOCATE also answers to the
+      // 50k priority-withdrawal min), so it can sit exactly on the 10k default.
+      const cfg = parseBandConfig({ ...REQUIRED, MAX_ALLOCATE_USDS: '10000' });
+      expect(cfg.maxAllocateUsds).toBe(cfg.minBandActionUsds);
+    });
+
+    it('accepts a MAX_DEALLOCATE_USDS step cap equal to a min action raised above the priority-withdrawal min', () => {
+      const cfg = parseBandConfig({ ...REQUIRED, MIN_BAND_ACTION_USDS: '100000', MAX_DEALLOCATE_USDS: '100000' });
       expect(cfg.maxDeallocateUsds).toBe(100_000n * WAD);
     });
   });

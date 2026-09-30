@@ -24,16 +24,19 @@
 /**
  * How the bot treats a market in bands mode:
  *   STEERED  — steered to a utilization band chosen from satAPY vs SSR_t.
+ *   PRIMARY  — no band: always asks for deposits up to its cap, served before any
+ *              other deposit (at most one market; see band-controller.ts).
  *   SOUNDING — reserved; configuring it refuses to start (see parseMarketMode).
  *   RETIRED  — the bot never touches the market.
  */
-export type MarketMode = 'STEERED' | 'SOUNDING' | 'RETIRED';
+export type MarketMode = 'STEERED' | 'PRIMARY' | 'SOUNDING' | 'RETIRED';
 
 export interface BandConfig {
   ssrTMarginBps: number;       // SSR_t = SSR + margin
   ssrTToleranceBps: number;    // HOLD zone = SSR_t +- tolerance
   utilDeadbandBps: number;     // no action within +-deadband of the band
-  minBandActionUsds: bigint;   // smaller legs are dropped
+  minBandActionUsds: bigint;   // smaller steering legs and priority deposits are dropped
+  minPriorityWithdrawalUsds: bigint; // smaller priority withdrawals (cap breaches) wait
   sleeveFloorBps: number;      // hard floor on the allocated sleeve, bps of totalAssets
   directionCooldownHours: number;
   monopolistShareBps: number;  // drains allowed only at/above this vault share
@@ -119,10 +122,14 @@ function parseRequiredPositiveUsds(raw: string | undefined, label: string): bigi
  * Parse and validate the full band-steering configuration from an env record.
  *
  * Env vars and defaults:
- *   SSR_T_MARGIN_BPS            — SSR_t = SSR + margin (25)
- *   SSR_T_TOLERANCE_BPS         — HOLD zone half-width around SSR_t (25)
+ *   SSR_T_MARGIN_BPS            — SSR_t = SSR + margin (0)
+ *   SSR_T_TOLERANCE_BPS         — HOLD zone half-width around SSR_t (25): the zone is
+ *                                 symmetric, [SSR - 25, SSR + 25] bps at the defaults —
+ *                                 a rate slightly under SSR is accepted in exchange for
+ *                                 more competitive borrow rates
  *   UTIL_DEADBAND_BPS           — no action within +-deadband of the band (50)
- *   MIN_BAND_ACTION_USDS        — smaller legs are dropped, whole USDS (100000)
+ *   MIN_BAND_ACTION_USDS        — smaller steering legs / priority deposits are dropped, whole USDS (10000)
+ *   MIN_PRIORITY_WITHDRAWAL_USDS — smaller priority withdrawals (cap breaches) wait, whole USDS (50000)
  *   SLEEVE_FLOOR_BPS            — hard sleeve floor as bps of totalAssets (1500)
  *   DIRECTION_COOLDOWN_HOURS    — min hours before reversing direction (24)
  *   MONOPOLIST_SHARE_BPS        — drains only when vault share >= this (8000)
@@ -130,17 +137,18 @@ function parseRequiredPositiveUsds(raw: string | undefined, label: string): bigi
  *   MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS — REQUIRED per-cycle step caps, whole USDS
  *
  * Throws on any invalid or missing-required value. Cross-field validation:
- *   - tolerance <= margin (the HOLD zone's lower edge is SSR_t - tolerance; a tolerance
- *     above the margin would accept rates below SSR, the depositor's opportunity cost)
+ *   - step caps >= MIN_BAND_ACTION_USDS, MAX_DEALLOCATE_USDS >= MIN_PRIORITY_WITHDRAWAL_USDS
+ *     (a step cap under a drop threshold would clamp every wish into the drop)
  *   - sleeve floor < 2000 bps (the sleeve cap is 20%; a floor at/above it is nonsensical)
  *   - SSR sanity bounds ordered (min < max)
  */
 export function parseBandConfig(env: Record<string, string | undefined>): BandConfig {
   const cfg: BandConfig = {
-    ssrTMarginBps: parseBps(env.SSR_T_MARGIN_BPS, 25, 'SSR_T_MARGIN_BPS'),
+    ssrTMarginBps: parseBps(env.SSR_T_MARGIN_BPS, 0, 'SSR_T_MARGIN_BPS'),
     ssrTToleranceBps: parseBps(env.SSR_T_TOLERANCE_BPS, 25, 'SSR_T_TOLERANCE_BPS'),
     utilDeadbandBps: parseBps(env.UTIL_DEADBAND_BPS, 50, 'UTIL_DEADBAND_BPS'),
-    minBandActionUsds: parseWholeUsds(env.MIN_BAND_ACTION_USDS, 100_000n, 'MIN_BAND_ACTION_USDS'),
+    minBandActionUsds: parseWholeUsds(env.MIN_BAND_ACTION_USDS, 10_000n, 'MIN_BAND_ACTION_USDS'),
+    minPriorityWithdrawalUsds: parseWholeUsds(env.MIN_PRIORITY_WITHDRAWAL_USDS, 50_000n, 'MIN_PRIORITY_WITHDRAWAL_USDS'),
     sleeveFloorBps: parseBps(env.SLEEVE_FLOOR_BPS, 1500, 'SLEEVE_FLOOR_BPS'),
     directionCooldownHours: parseWholeNumber(env.DIRECTION_COOLDOWN_HOURS, 24, 'DIRECTION_COOLDOWN_HOURS'),
     monopolistShareBps: parseBps(env.MONOPOLIST_SHARE_BPS, 8000, 'MONOPOLIST_SHARE_BPS'),
@@ -150,12 +158,6 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
     maxDeallocateUsds: parseRequiredPositiveUsds(env.MAX_DEALLOCATE_USDS, 'MAX_DEALLOCATE_USDS'),
   };
 
-  if (cfg.ssrTToleranceBps > cfg.ssrTMarginBps) {
-    throw new Error(
-      `SSR_T_TOLERANCE_BPS (${cfg.ssrTToleranceBps}) must be <= SSR_T_MARGIN_BPS (${cfg.ssrTMarginBps}) — ` +
-      `a wider tolerance would accept rates below SSR itself`
-    );
-  }
   if (cfg.sleeveFloorBps >= 2000) {
     throw new Error(
       `SLEEVE_FLOOR_BPS must be < 2000 (the floor lives inside the 20% sleeve), got ${cfg.sleeveFloorBps}`
@@ -171,6 +173,13 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
       `MAX_ALLOCATE_USDS and MAX_DEALLOCATE_USDS must be >= MIN_BAND_ACTION_USDS ` +
       `(${cfg.minBandActionUsds / USDS_WAD} USDS) — a step cap below the min action would clamp ` +
       `every wish under the drop threshold and the bot could never move funds`
+    );
+  }
+  if (cfg.maxDeallocateUsds < cfg.minPriorityWithdrawalUsds) {
+    throw new Error(
+      `MAX_DEALLOCATE_USDS must be >= MIN_PRIORITY_WITHDRAWAL_USDS ` +
+      `(${cfg.minPriorityWithdrawalUsds / USDS_WAD} USDS) — a step cap below it would clamp ` +
+      `every priority withdrawal under its drop threshold and a cap breach could never be drained`
     );
   }
 
