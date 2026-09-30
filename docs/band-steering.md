@@ -202,7 +202,7 @@ to the target the controller already headroomed.
 | `MIN_PRIORITY_WITHDRAWAL_USDS` | `50000` | smallest priority withdrawal, whole USDS; a smaller breach waits (a zero cap drains from the 100 USDS dust floor instead) |
 | `SSR_T_MARGIN_BPS` | `0` | global SSR_t margin for STEERED markets |
 | `SSR_T_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
-| `SSR_T_TOLERANCE_BPS` | `25` | zone half-width; validated ≤ margin |
+| `SSR_T_TOLERANCE_BPS` | `25` | zone half-width |
 | `UTIL_DEADBAND_BPS` | `50` | |
 | `MIN_BAND_ACTION_USDS` | `10000` | whole USDS; smallest steering leg or priority deposit |
 | `SLEEVE_FLOOR_BPS` | `1500` | validated < 2000 |
