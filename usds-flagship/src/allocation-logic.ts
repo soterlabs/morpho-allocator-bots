@@ -14,12 +14,72 @@ const WAD = 1_000_000_000_000_000_000n; // 1e18
 export const CAP_HEADROOM_BPS = 1n;
 
 /**
+ * A cap less CAP_HEADROOM_BPS: the ceiling a deposit may land on. The vault checks
+ * every allocate against the position INCLUDING the interest accrued since the bot's
+ * pinned read, so a target sitting exactly on a cap is over it by the time the tx
+ * lands. The same headroom applies to the on-chain relative cap and to an env cap
+ * that mirrors an on-chain absolute cap (PT-sUSDS's 5M).
+ */
+export function withCapHeadroom(cap: bigint): bigint {
+  return cap - (cap * CAP_HEADROOM_BPS) / 10000n;
+}
+
+/**
  * Percentage of pool supply reserved as a liquidity cushion when deallocating.
  * Prevents the bot from pushing market utilization too high.
  * Default 5% means we leave at least 5% of the pool's totalSupply as idle liquidity.
  * Override via env var LIQUIDITY_RESERVE_PERCENT (integer, e.g. "0" to disable cushion).
  */
 export const LIQUIDITY_RESERVE_PERCENT = BigInt(process.env.LIQUIDITY_RESERVE_PERCENT ?? '5');
+
+/**
+ * Smallest position worth a transaction (100 USDS): the executor's dust floor for
+ * deallocations and sweeps, and the bands controller's floor for draining a zero-cap
+ * market — a residue under it is tolerated rather than chased with more Safe txs.
+ */
+export const DUST_FLOOR_USDS = 100n * 10n ** 18n;
+
+/**
+ * How far above the sleeve floor reconciliation lands a floor-bound plan (100 USDS).
+ * Deallocations execute in full, but an allocate can execute slightly under its plan
+ * leg (the live on-chain cap may sit below the pinned one; the fresh position carries
+ * interest accrued since the pinned block), so a plan resting exactly on the floor would
+ * end the batch a few USDS under it and the batch guard would abort — with no tx the
+ * same state recurs next cycle, an abort loop. Far above minutes of interest on one
+ * position; the guard itself still measures against the true floor.
+ */
+export const FLOOR_LANDING_MARGIN_USDS = 100n * 10n ** 18n;
+
+/**
+ * Deposit ceiling the executor sizes a bands-mode allocate against. planAllocations sends
+ * ceiling − freshExpected, so the ceiling is the plan target shifted onto the fresh
+ * position (the leg itself, whatever interest accrued since the pinned block), bounded
+ * by the live on-chain relative and absolute caps, each with headroom. The controller
+ * already applied CAP_HEADROOM_BPS to both pinned caps (on-chain relative and env) when
+ * it sized the target; applying it again to the target would shrink every allocate by
+ * 1 bps of the TARGET (400 USDS on a 4M target) and break a floor-landing plan in the
+ * batch guard.
+ */
+export function bandsAllocateCeiling(args: {
+  targetAmount: bigint;
+  pinnedAssets: bigint;
+  freshExpected: bigint;
+  /** Live relative-cap limit with headroom; undefined when the vault reports no cap. */
+  liveCapWithHeadroom?: bigint;
+  /**
+   * Live absolute cap with headroom. The env cap only mirrors it, and a curator or
+   * sentinel can lower it with no timelock, so the mirror may be stale: without this
+   * bound the allocate reverts and takes the whole batch down every cycle. 2^128 − 1
+   * (unlimited) never binds; 0 yields a zero ceiling, a routine skip-atcap.
+   */
+  liveAbsoluteCapWithHeadroom?: bigint;
+}): { ceiling: bigint; clampedByLiveCap: boolean } {
+  const { targetAmount, pinnedAssets, freshExpected, liveCapWithHeadroom, liveAbsoluteCapWithHeadroom } = args;
+  const shifted = targetAmount + (freshExpected - pinnedAssets);
+  const liveCaps = [liveCapWithHeadroom, liveAbsoluteCapWithHeadroom].filter((cap): cap is bigint => cap !== undefined);
+  const ceiling = liveCaps.reduce((min, cap) => (cap < min ? cap : min), shifted);
+  return { ceiling, clampedByLiveCap: ceiling < shifted };
+}
 
 export interface AllocationAction {
   marketIndex: number;
@@ -50,6 +110,14 @@ export interface AllocationInput {
   // the vault. Defaults to 0n (disabled) when omitted. Set this to the bot's dust floor
   // (minAllocationAmount) so retired markets drain down to genuine dust, not to ~0.1%.
   minSweepAmount?: bigint;
+  // Optional explicit per-market sweep (drain-to-zero) flags, one entry per
+  // perMarketAssets[] entry. Sweep semantics for market i are
+  //   sweepByIndex?.[i] ?? (targetPerMarketBpsByIndex[i] === 0)
+  // i.e. when omitted (or an entry is undefined) the legacy rule applies: a target-0
+  // market is a retired market and is swept. Bands mode supplies an explicit all-false
+  // vector — it never sweeps (RETIRED markets are left untouched), and its bps targets
+  // carry no meaning, so the legacy inference must not run.
+  sweepByIndex?: boolean[];
 }
 
 export interface AllocationResult {
@@ -224,6 +292,7 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
     targetPerMarketAmountsByIndex,
     rebalanceThresholdBps,
     minSweepAmount = 0n,
+    sweepByIndex,
   } = input;
 
   if (targetPerMarketBpsByIndex.length !== perMarketAssets.length) {
@@ -234,6 +303,11 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
   if (targetPerMarketAmountsByIndex !== undefined && targetPerMarketAmountsByIndex.length !== perMarketAssets.length) {
     throw new Error(
       `targetPerMarketAmountsByIndex length (${targetPerMarketAmountsByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
+    );
+  }
+  if (sweepByIndex !== undefined && sweepByIndex.length !== perMarketAssets.length) {
+    throw new Error(
+      `sweepByIndex length (${sweepByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
     );
   }
 
@@ -263,7 +337,10 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
     const devBps = Number((diff * 10000n) / totalAssets);
     if (devBps > maxDeviationBps) maxDeviationBps = devBps;
 
-    if (minSweepAmount > 0n && targetBps === 0 && current >= minSweepAmount) {
+    // Sweep flag: explicit per-market override (bands mode) or the legacy
+    // "target-0 means retired" inference.
+    const sweep = sweepByIndex?.[i] ?? (targetBps === 0);
+    if (minSweepAmount > 0n && sweep && current >= minSweepAmount) {
       sweepNeeded = true;
     }
 
@@ -295,15 +372,19 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
 /**
  * Whether a deallocation should execute under the dust filter.
  *
- * Drain-to-zero markets (targetBps === 0) ALWAYS execute, so a retiring market fully
- * empties rather than stranding a sub-floor residual forever (the migration's whole
- * point). For other markets, a negligible trim (desired excess below the floor) is
- * suppressed. The decision is made on the DESIRED (pre-liquidity-cap) excess so that a
- * liquidity-limited large drain still makes incremental progress every run instead of
- * being dropped because this run's withdrawable slice happens to be small.
+ * Drain-to-zero markets ALWAYS execute, so a retiring market fully empties rather than
+ * stranding a sub-floor residual forever (the migration's whole point). For other
+ * markets, a negligible trim (desired excess below the floor) is suppressed. The
+ * decision is made on the DESIRED (pre-liquidity-cap) excess so that a liquidity-limited
+ * large drain still makes incremental progress every run instead of being dropped
+ * because this run's withdrawable slice happens to be small.
+ *
+ * The optional `sweep` flag overrides the drain-to-zero inference: when provided it is
+ * authoritative (bands mode drives sweeps from band decisions, where a zero targetBps
+ * carries no "retired" meaning); when omitted the legacy targetBps === 0 rule applies.
  */
-export function shouldExecuteDeallocate(desiredAmount: bigint, targetBps: number, minAmount: bigint): boolean {
-  if (targetBps === 0) return true;
+export function shouldExecuteDeallocate(desiredAmount: bigint, targetBps: number, minAmount: bigint, sweep?: boolean): boolean {
+  if (sweep ?? (targetBps === 0)) return true;
   return desiredAmount >= minAmount;
 }
 
@@ -321,6 +402,9 @@ export interface DeallocatePlanItem {
   capped: boolean;            // true if cappedAmount < desired due to liquidity
   skipped: boolean;           // true if no withdrawable liquidity at all
   availableLiquidity: bigint;
+  // Optional explicit drain-to-zero flag (see shouldExecuteDeallocate). When omitted the
+  // legacy targetBps === 0 inference applies; bands mode sets it from band decisions.
+  sweep?: boolean;
 }
 
 export type DeallocateOutcome =
@@ -339,7 +423,7 @@ export function planDeallocations(items: DeallocatePlanItem[], minAmount: bigint
     if (it.skipped) {
       return { marketIndex: it.marketIndex, status: 'skip-liquidity', availableLiquidity: it.availableLiquidity };
     }
-    if (!shouldExecuteDeallocate(it.desired, it.targetBps, minAmount)) {
+    if (!shouldExecuteDeallocate(it.desired, it.targetBps, minAmount, it.sweep)) {
       return { marketIndex: it.marketIndex, status: 'skip-dust', desired: it.desired };
     }
     return { marketIndex: it.marketIndex, status: 'execute', amount: it.cappedAmount, capped: it.capped, availableLiquidity: it.availableLiquidity };
@@ -386,6 +470,11 @@ export function planAllocations(items: AllocatePlanItem[], minAmount: bigint): A
  * scaled down proportionally to its share of the total, and any result below minAmount is
  * dropped as dust. A non-positive budget (adapter already at/over cap) yields no
  * allocations — the bot just deallocates this cycle and grows next cycle as room frees up.
+ *
+ * With a priorityIndex (bands mode's PRIMARY market) that market is funded first, up to
+ * the whole budget, and only the others are scaled into what is left: reconciliation
+ * serves PRIMARY before the band wishes, and a pro-rata cut here would undo that while
+ * STEERED markets still receive funds.
  */
 /**
  * Room available for new allocations this cycle under the vault's AGGREGATE adapter cap.
@@ -410,12 +499,24 @@ export function capAllocationsToBudget(
   allocations: { marketIndex: number; amount: bigint }[],
   budget: bigint,
   minAmount: bigint,
+  priorityIndex?: number,
 ): { marketIndex: number; amount: bigint }[] {
   if (budget <= 0n) return [];
   const total = allocations.reduce((sum, a) => sum + a.amount, 0n);
   if (total <= budget) return allocations;
+  const priorityWish = allocations.find(a => a.marketIndex === priorityIndex)?.amount ?? 0n;
+  const priorityAmount = priorityWish < budget ? priorityWish : budget;
+  // Without a priority market this is the plain pro-rata scale, the whole budget over the
+  // whole total. Floor division keeps the sum at or under the budget either way.
+  const othersBudget = budget - priorityAmount;
+  const othersTotal = total - priorityWish;
   return allocations
-    .map(a => ({ marketIndex: a.marketIndex, amount: (a.amount * budget) / total }))
+    .map(a => ({
+      marketIndex: a.marketIndex,
+      amount: a.marketIndex === priorityIndex
+        ? priorityAmount
+        : othersTotal === 0n ? 0n : (a.amount * othersBudget) / othersTotal,
+    }))
     .filter(a => a.amount >= minAmount);
 }
 
@@ -436,6 +537,23 @@ export interface CappedAction {
   capped: boolean;       // true if amount was reduced due to liquidity
   skipped: boolean;      // true if skipped entirely (no withdrawable liquidity)
   availableLiquidity: bigint;
+}
+
+/**
+ * Maximum amount withdrawable from a market under the flat supply-reserve cushion:
+ *   reserve = totalSupplyAssets * reservePercent / 100
+ *   max(0, (totalSupplyAssets - totalBorrowAssets) - reserve)
+ * Shared by the executor's liquidity cap and the bands controller's cap-breach
+ * sizing, so a planned drain is never larger than the executor will let through.
+ */
+export function maxWithdrawableWithReserve(
+  totalSupplyAssets: bigint,
+  totalBorrowAssets: bigint,
+  reservePercent: bigint,
+): bigint {
+  const liquidity = totalSupplyAssets > totalBorrowAssets ? totalSupplyAssets - totalBorrowAssets : 0n;
+  const reserve = totalSupplyAssets * reservePercent / 100n;
+  return liquidity > reserve ? liquidity - reserve : 0n;
 }
 
 /**
@@ -474,10 +592,7 @@ export function capDeallocationsToLiquidity(
     //  - otherwise: reserve LIQUIDITY_RESERVE_PERCENT of totalSupply as a flat cushion.
     const maxWithdrawable = ml.maxUtilizationBps !== undefined
       ? maxWithdrawableForUtilization(ml.totalSupplyAssets, ml.totalBorrowAssets, ml.maxUtilizationBps)
-      : (() => {
-          const reserve = ml.totalSupplyAssets * LIQUIDITY_RESERVE_PERCENT / 100n;
-          return liquidity > reserve ? liquidity - reserve : 0n;
-        })();
+      : maxWithdrawableWithReserve(ml.totalSupplyAssets, ml.totalBorrowAssets, LIQUIDITY_RESERVE_PERCENT);
 
     if (maxWithdrawable === 0n) {
       return { marketIndex: a.marketIndex, amount: 0n, capped: false, skipped: true, availableLiquidity: liquidity };

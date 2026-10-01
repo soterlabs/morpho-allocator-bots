@@ -1,38 +1,92 @@
 /**
  * Flagship Vault V2 Allocator Bot
  *
- * This bot maintains the 80% idle / 20% allocated strategy for the Flagship USDS Vault.
- * It allocates across 5 markets: stUSDS, cbBTC, wstETH, PT-sUSDS, WETH (all with USDS as loan
- * token). Each market has its own target in basis points, overridable via TARGET_<MARKET>_BPS.
- * Current scheme retires stUSDS and WETH to 0% and targets ~6.66% each on cbBTC/wstETH/PT-sUSDS
- * (667/667/666 = 2000). PT-sUSDS additionally has a 5M USDS absolute cap enforced off-chain by
- * the bot; overflow above the cap is split equally between cbBTC and wstETH. WETH is drained
- * only up to 93% market utilization (waits above it).
+ * This bot steers the 80% idle / 20% allocated strategy for the Flagship USDS Vault
+ * across 5 markets: stUSDS, cbBTC, wstETH, PT-sUSDS, WETH (all with USDS as loan token).
+ *
+ * Two allocation modes, selected by the REQUIRED env var ALLOCATION_MODE:
+ *
+ *   'bps'   — legacy static targets. Each market has a target in basis points
+ *             (TARGET_<MARKET>_BPS; sum must equal targetAllocatedPercent). PT-sUSDS has a
+ *             5M USDS absolute cap enforced off-chain; overflow above the cap is split
+ *             equally between cbBTC and wstETH. WETH is drained only up to 93% market
+ *             utilization (waits above it).
+ *
+ *   'bands' — satAPY band steering. Per-market targets come from computeBandDecisions
+ *             (band-controller.ts): each STEERED market is held to a utilization band
+ *             chosen from its satAPY vs thresholds derived from the on-chain SSR;
+ *             RETIRED markets are never touched. The per-market wishes are then
+ *             reconciled against the vault-level sleeve limits (reconcile.ts) before
+ *             execution. The decision inputs and the resulting rules are logged as one
+ *             BAND_TRACE JSON line per run, including a log-only 24h anchor-rate
+ *             projection at post-trade utilization (A/B bracket, no veto).
  *
  * Transactions are executed through a Safe 1/3 multisig. The bot is one of the 3 signers
  * and can execute autonomously since the threshold is 1.
  *
- * Run as a cronjob (deployed every 6 hours, i.e. cron "0 0,6,12,18 * * *"):
- *   0 0,6,12,18 * * * cd /path/to/bot && npm run allocate >> /var/log/allocator.log 2>&1
+ * Run as a Railway cron service every hour (cronSchedule in railway.toml).
  *
  * Environment Variables (see .env.example):
- *   - RPC_URL: Ethereum RPC endpoint
+ *   - ALLOCATION_MODE: REQUIRED, 'bps' | 'bands'
+ *   - RPC_URL: Ethereum RPC endpoint (REQUIRED, no default)
  *   - PRIVATE_KEY: Bot signer's private key (one of the Safe owners)
  *   - SAFE_ADDRESS: Safe 1/3 multisig address (set as allocator on the vault)
  *   - VAULT_ADDRESS: Flagship Vault V2 address
  *   - ADAPTER_ADDRESS: MorphoMarketV1AdapterV2 address
+ *   - BOT_PAUSED: 'true' -> log and exit 0 without touching anything
  */
 
-import { createPublicClient, createWalletClient, http, formatEther, parseEther, encodeFunctionData, encodeAbiParameters, keccak256, hexToBytes, bytesToHex, type Address, type Hex } from 'viem';
+import { createPublicClient, createWalletClient, http, formatEther, parseEther, encodeFunctionData, hexToBytes, bytesToHex, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
+import { createHash } from 'node:crypto';
+import { Market, MarketParams } from '@morpho-org/blue-sdk';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, parseTargetBps, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, withCapHeadroom, DUST_FLOOR_USDS, FLOOR_LANDING_MARGIN_USDS, LIQUIDITY_RESERVE_PERCENT, bandsAllocateCeiling, capDeallocationsToLiquidity, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi, encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId, validateBandsMarkets, validateBpsMarkets } from './market-config.js';
+import { bandsCaps, isDrainToZero, toReconcileMarket } from './band-plan.js';
+import { parseBandConfig, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
+import { computeBandDecisions, type MarketObservation, type BandDecision } from './band-controller.js';
+import { reconcileToVaultLimits, type ReconcileMarket } from './reconcile.js';
+import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
+import { simulateAnchor, anchorPerSecWadToApy, postTradeUtilizationWad } from './anchor-sim.js';
+import { fetchActionHistory, type ActionHistoryClient } from './onchain-history.js';
+
+// Emergency stop: BOT_PAUSED=true short-circuits the cron cycle cleanly (exit 0)
+// IMMEDIATELY — before RPC_URL/mode/config validation, any of which can throw. The kill
+// switch must work unconditionally, including (especially) when the rest of the env is
+// broken; a bot paused BECAUSE its config is bad must not exit 1 on that bad config.
+// (`log` is a hoisted function declaration, so calling it here is safe.)
+if (process.env.BOT_PAUSED === 'true') {
+  log('BOT_PAUSED=true — bot is paused, exiting cleanly without doing anything');
+  process.exit(0);
+}
 
 // ============ CONFIGURATION ============
 
+/**
+ * Parse an optional positive-integer env var, failing loud on anything present but
+ * malformed — same posture as parseTargetBps: only `/^\d+$/` values pass, so empty
+ * strings, negatives, decimals, hex, and scientific notation all throw instead of
+ * silently coercing. Zero is rejected too (a zero timeout/lookback masks misconfig).
+ */
+function parsePositiveIntEnv(raw: string | undefined, defaultValue: number, label: string): number {
+  if (raw === undefined) return defaultValue;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) === 0) {
+    throw new Error(`${label} must be a positive whole number, got "${raw}"`);
+  }
+  return Number(trimmed);
+}
+
+// RPC_URL is REQUIRED — no public-endpoint default. A silently-defaulted RPC can mask a
+// misconfigured deployment behind rate limits and stale reads; fail loud instead.
+if (!process.env.RPC_URL) {
+  throw new Error('RPC_URL environment variable is required');
+}
+
 const config = {
-  rpcUrl: process.env.RPC_URL || 'https://eth.llamarpc.com',
+  rpcUrl: process.env.RPC_URL,
   privateKey: process.env.PRIVATE_KEY as Hex,
   safeAddress: process.env.SAFE_ADDRESS as Address,
   vaultAddress: process.env.VAULT_ADDRESS as Address,
@@ -43,130 +97,109 @@ const config = {
   targetIdlePercent: 8000, // 80%
   targetAllocatedPercent: 2000, // 20%
 
-  // Rebalance threshold - only rebalance if deviation exceeds this (in basis points)
+  // Rebalance threshold - only rebalance if deviation exceeds this (in basis points).
+  // bps mode only: bands mode gates on "any band target differs from the current position
+  // beyond the dust floor" instead (see main).
   rebalanceThresholdBps: 10, // 0.1%
 
   // Minimum allocation amount (to avoid dust transactions)
-  minAllocationAmount: parseEther('100'), // 100 USDS minimum
+  minAllocationAmount: DUST_FLOOR_USDS,
 
   // Optional per-market cap on how much to deallocate in a single cycle (USDS). Lets the
   // migration proceed in smaller, gentler steps. 0 (default) means no extra cap — each
   // deallocation is limited only by the target and the pool's available liquidity.
+  // In bands mode MAX_DEALLOCATE_USDS is REQUIRED > 0 (enforced by parseBandConfig); the
+  // band controller already clamps drains to it, so this executor-side cap is a second,
+  // redundant bound there.
   maxDeallocatePerCycle: parseEther(process.env.MAX_DEALLOCATE_USDS || '0'),
+
+  // Upper bound (ms) on waiting for the Safe tx receipt. A hung RPC or a stuck tx must
+  // fail the run (non-zero exit) instead of blocking the cron slot indefinitely.
+  receiptTimeoutMs: parsePositiveIntEnv(process.env.RECEIPT_TIMEOUT_MS, 300_000, 'RECEIPT_TIMEOUT_MS'),
+
+  // Bands mode: how many blocks back to scan Morpho Blue Supply/Withdraw events for the
+  // adapter, to resolve last-action timestamps for the direction-change cooldown.
+  // 7500 blocks ~ 25h at 12s/block, just over the 24h cooldown window.
+  cooldownLookbackBlocks: parsePositiveIntEnv(process.env.COOLDOWN_LOOKBACK_BLOCKS, 7500, 'COOLDOWN_LOOKBACK_BLOCKS'),
 
   // Dry run mode (set to true to simulate without executing)
   dryRun: process.env.DRY_RUN === 'true',
 };
 
-// Market configurations - loaded from environment
-interface MarketConfig {
-  name: string;
-  collateral: Address;
-  oracle: Address;
-  lltv: bigint;
-  // Per-market target allocation in basis points (10000 = 100%).
-  // Sum across all configured markets must equal config.targetAllocatedPercent.
-  targetBps: number;
-  // Optional absolute cap (in USDS) on this market's allocated amount, enforced off-chain by
-  // the bot (not a market/vault param). When the bps target exceeds this, the market is held
-  // at the cap and the overflow is redistributed to overflowReceiver markets. Used by
-  // PT-sUSDS/USDS (5M cap).
-  absoluteCap?: bigint;
-  // When true, this market absorbs an equal share of overflow from absolute-capped markets on
-  // top of its own bps target. Set on cbBTC/USDS and wstETH/USDS to soak up PT-sUSDS overflow.
-  overflowReceiver?: boolean;
-  // Optional max utilization (bps) for deallocations from this market. When set, withdrawals
-  // are capped so post-withdraw utilization stays <= this (and skipped/waited once already
-  // at/above it) instead of the flat supply-reserve cushion. Set on WETH/USDS (9300 = 93%).
-  maxUtilizationBps?: number;
-  encodedParams?: Hex;
+// ALLOCATION_MODE is REQUIRED with no default: 'bps' runs today's static-target DECISION
+// logic identically (targets, sweep inference, threshold, caps, liquidity handling and
+// ordering unchanged, incl. validateTargetBpsSum); 'bands' runs the Phase A
+// utilization-band steering. NOTE the failure-path hardening is shared by BOTH modes and
+// deliberately differs from the pre-bands code: RPC_URL is required (no public default),
+// execution errors propagate to a non-zero exit (no try/catch), plus the pending-nonce
+// guard and bounded receipt wait — mandated by the repo's fail-loud ground rules. Anything
+// else (including unset) throws at module load — an allocator must never guess its strategy.
+const allocationModeRaw = process.env.ALLOCATION_MODE;
+if (allocationModeRaw !== 'bps' && allocationModeRaw !== 'bands') {
+  throw new Error(`ALLOCATION_MODE is required and must be 'bps' or 'bands', got "${allocationModeRaw}"`);
 }
+const allocationMode: 'bps' | 'bands' = allocationModeRaw;
 
-// Most markets use 86% LLTV per BA Labs recommendation (02/02/2026). PT-sUSDS/USDS uses 91.5%.
-const LLTV_86_PERCENT = '860000000000000000';
-const LLTV_91_5_PERCENT = '915000000000000000';
+// Bands mode: parse the full band-steering configuration up front (throws on any invalid
+// or missing-required value, e.g. MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS must be > 0).
+const bandConfig: BandConfig | undefined = allocationMode === 'bands' ? parseBandConfig(process.env) : undefined;
 
-// Existing stUSDS oracle from USDS vault deployment
-const EXISTING_STUSDS_ORACLE = '0x0A976226d113B67Bd42D672Ac9f83f92B44b454C';
-// PT-sUSDS/USDS market oracle (MorphoChainlinkOracleV2). See soterlabs/morpho-market-pt-susds.
-const PT_SUSDS_ORACLE = '0xda5901EF31ecAFa6561B2e56B4997FAdd3dB4646';
+if (allocationMode === 'bps') {
+  // Fail fast on a misconfigured strategy: the per-market targets must sum to the
+  // overall allocated target, otherwise the idle/allocated split silently drifts.
+  // Validated over ALL markets (not just oracle-configured ones) so that a partial
+  // deployment doesn't false-positive. NOTE: a market that needs allocation OR
+  // deallocation must also have its oracle set (see the m.oracle !== '0x0' filter in
+  // main) — e.g. the migration requires ORACLE_WETH so WETH can be drained to 0%.
+  validateTargetBpsSum(markets.map(m => ({ label: m.name, bps: m.targetBps })), config.targetAllocatedPercent);
+  validateBpsMarkets(markets);
 
-// PT-sUSDS/USDS absolute allocation cap (5M USDS), enforced off-chain by the bot. When the
-// market's bps target exceeds this, PT-sUSDS is held at 5M and the overflow is split equally
-// between cbBTC/USDS and wstETH/USDS. Override via env PT_SUSDS_ABSOLUTE_CAP_USDS.
-const PT_SUSDS_ABSOLUTE_CAP = parseEther(process.env.PT_SUSDS_ABSOLUTE_CAP_USDS || '5000000');
+  // Hard-fail when a retired market (targetBps === 0) has no oracle. target-0 means "this
+  // market must hold nothing", but without an oracle it can't be addressed or drained, so
+  // any funds it holds are stranded and the 80% idle buffer silently breaks. Unlike a
+  // target>0 market with no oracle (which merely can't be funded — a non-fatal shortfall,
+  // warned at runtime), this is a fund-safety issue, so we refuse to start.
+  const undrainable = markets.filter(m => m.targetBps === 0 && m.oracle === '0x0');
+  if (undrainable.length > 0) {
+    throw new Error(
+      `${undrainable.map(m => m.name).join(', ')} have targetBps=0 but no oracle configured — ` +
+      `a retired market cannot be drained without its oracle. Set their ORACLE_* env vars ` +
+      `(e.g. ORACLE_WETH for the migration) before running.`
+    );
+  }
+} else {
+  // At most one PRIMARY market; every STEERED/PRIMARY market has a cap (its breach line).
+  validateBandsMarkets(markets);
 
-// Max utilization (bps) the bot will push a drained market to when withdrawing. WETH/USDS is
-// being retired to 0%; we withdraw only up to 93% utilization and wait above it. Override via
-// env WETH_MAX_UTILIZATION_BPS.
-const WETH_MAX_UTILIZATION_BPS = parseTargetBps(process.env.WETH_MAX_UTILIZATION_BPS, 9300, 'WETH_MAX_UTILIZATION_BPS');
+  // A steered market must be addressable: without an oracle its market id cannot be
+  // derived, so it would be silently dropped from the run — never observed, never
+  // steered, its position invisible to the sleeve accounting. Refuse to start.
+  const unsteerable = markets.filter(m => m.mode !== 'RETIRED' && m.oracle === '0x0');
+  if (unsteerable.length > 0) {
+    throw new Error(
+      `${unsteerable.map(m => m.name).join(', ')} are not RETIRED but have no oracle configured — ` +
+      `set their ORACLE_* env vars or set MODE_<MARKET>=RETIRED.`
+    );
+  }
 
-// Per-market target defaults (basis points). Override via env vars. Current scheme retires
-// stUSDS and WETH to 0% and splits the 20% allocated target across cbBTC/wstETH/PT-sUSDS
-// (~6.66% each: 667/667/666, so the five-market sum is exactly 2000). PT-sUSDS
-// is additionally bounded by its 5M absolute cap, with overflow going to cbBTC and wstETH.
-const markets: MarketConfig[] = [
-  {
-    name: 'stUSDS/USDS',
-    collateral: '0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9' as Address,
-    oracle: (process.env.ORACLE_STUSDS || EXISTING_STUSDS_ORACLE) as Address,
-    lltv: BigInt(process.env.LLTV_STUSDS || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_STUSDS_BPS, 0, 'TARGET_STUSDS_BPS'),
-  },
-  {
-    name: 'cbBTC/USDS',
-    collateral: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' as Address,
-    oracle: (process.env.ORACLE_CBBTC || '0x0') as Address,
-    lltv: BigInt(process.env.LLTV_CBBTC || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_CBBTC_BPS, 667, 'TARGET_CBBTC_BPS'),
-    overflowReceiver: true,
-  },
-  {
-    name: 'wstETH/USDS',
-    collateral: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0' as Address,
-    oracle: (process.env.ORACLE_WSTETH || '0x0') as Address,
-    lltv: BigInt(process.env.LLTV_WSTETH || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_WSTETH_BPS, 667, 'TARGET_WSTETH_BPS'),
-    overflowReceiver: true,
-  },
-  {
-    name: 'PT-sUSDS/USDS',
-    collateral: '0xdC169AbE56461A2E0c034Da431Ac2a3ebf596094' as Address,
-    oracle: (process.env.ORACLE_PTSUSDS || PT_SUSDS_ORACLE) as Address,
-    lltv: BigInt(process.env.LLTV_PTSUSDS || LLTV_91_5_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_PTSUSDS_BPS, 666, 'TARGET_PTSUSDS_BPS'),
-    absoluteCap: PT_SUSDS_ABSOLUTE_CAP,
-  },
-  {
-    name: 'WETH/USDS',
-    collateral: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' as Address,
-    oracle: (process.env.ORACLE_WETH || '0x0') as Address,
-    lltv: BigInt(process.env.LLTV_WETH || LLTV_86_PERCENT),
-    targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, 0, 'TARGET_WETH_BPS'),
-    maxUtilizationBps: WETH_MAX_UTILIZATION_BPS,
-  },
-];
-
-// Fail fast on a misconfigured strategy: the per-market targets must sum to the
-// overall allocated target, otherwise the idle/allocated split silently drifts.
-// Validated over ALL markets (not just oracle-configured ones) so that a partial
-// deployment doesn't false-positive. NOTE: a market that needs allocation OR
-// deallocation must also have its oracle set (see the m.oracle !== '0x0' filter in
-// main) — e.g. the migration requires ORACLE_WETH so WETH can be drained to 0%.
-validateTargetBpsSum(markets.map(m => ({ label: m.name, bps: m.targetBps })), config.targetAllocatedPercent);
-
-// Hard-fail when a retired market (targetBps === 0) has no oracle. target-0 means "this
-// market must hold nothing", but without an oracle it can't be addressed or drained, so
-// any funds it holds are stranded and the 80% idle buffer silently breaks. Unlike a
-// target>0 market with no oracle (which merely can't be funded — a non-fatal shortfall,
-// warned at runtime), this is a fund-safety issue, so we refuse to start.
-const undrainable = markets.filter(m => m.targetBps === 0 && m.oracle === '0x0');
-if (undrainable.length > 0) {
-  throw new Error(
-    `${undrainable.map(m => m.name).join(', ')} have targetBps=0 but no oracle configured — ` +
-    `a retired market cannot be drained without its oracle. Set their ORACLE_* env vars ` +
-    `(e.g. ORACLE_WETH for the migration) before running.`
-  );
+  // The direction cooldown is reconstructed from a BOUNDED event scan
+  // (COOLDOWN_LOOKBACK_BLOCKS). If the scan window is shorter than the cooldown,
+  // events older than the window read as undefined ("no recent action") and the cooldown
+  // silently stops binding — exactly the masked-misconfig failure mode the repo forbids.
+  // Enforce the coupling: the window (~12s/block) must cover the cooldown plus a
+  // 1h safety margin for block-time variance. The defaults line up exactly:
+  // 7500 blocks x 12s = 90000s = 24h cooldown + 1h margin.
+  const lookbackSec = config.cooldownLookbackBlocks * 12;
+  const requiredSec = bandConfig!.directionCooldownHours * 3600 + 3600;
+  if (lookbackSec < requiredSec) {
+    throw new Error(
+      `COOLDOWN_LOOKBACK_BLOCKS=${config.cooldownLookbackBlocks} covers only ~${lookbackSec}s at 12s/block, ` +
+      `but the configured cooldown needs >= ${requiredSec}s ` +
+      `(DIRECTION_COOLDOWN_HOURS = ${bandConfig!.directionCooldownHours}h + 1h safety margin) — ` +
+      `events falling outside the scan window would silently unbind the cooldown. ` +
+      `Raise COOLDOWN_LOOKBACK_BLOCKS or lower the cooldown hours.`
+    );
+  }
 }
 
 // parseEther accepts a leading '-', so a fat-fingered negative would silently disable the
@@ -176,10 +209,6 @@ if (config.maxDeallocatePerCycle < 0n) {
 }
 
 // Constants
-const USDS = '0xdC035D45d973E3EC169d2276DDab16f1e407384F' as Address;
-const IRM_ADAPTIVE = '0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC' as Address;
-const MORPHO_BLUE = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as Address;
-
 // Safe MultiSendCallOnly (v1.4.1) — matches our Safe version
 const MULTISEND = '0x9641d764fc13c8B624c04430C7356C1C7C8102e2' as Address;
 
@@ -205,6 +234,16 @@ const vaultAbi = [
     // keccak256(abi.encode("collateralToken", collateral)). Used to clamp allocations
     // so we never exceed the on-chain cap (which would revert the whole batch).
     name: 'relativeCap',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'id', type: 'bytes32' }],
+    outputs: [{ type: 'uint256' }],
+  },
+  {
+    // Per-id absolute cap in asset units (2^128 − 1 = unlimited). A curator or sentinel
+    // can lower it with no timelock, so the bands executor clamps allocates to the live
+    // value rather than trusting the env cap that mirrors it.
+    name: 'absoluteCap',
     type: 'function',
     stateMutability: 'view',
     inputs: [{ name: 'id', type: 'bytes32' }],
@@ -265,23 +304,6 @@ const adapterAbi = [
   },
 ] as const;
 
-const morphoBlueAbi = [
-  {
-    name: 'market',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [{ name: 'id', type: 'bytes32' }],
-    outputs: [
-      { name: 'totalSupplyAssets', type: 'uint128' },
-      { name: 'totalSupplyShares', type: 'uint128' },
-      { name: 'totalBorrowAssets', type: 'uint128' },
-      { name: 'totalBorrowShares', type: 'uint128' },
-      { name: 'lastUpdate', type: 'uint128' },
-      { name: 'fee', type: 'uint128' },
-    ],
-  },
-] as const;
-
 const erc20Abi = [
   {
     name: 'balanceOf',
@@ -289,6 +311,18 @@ const erc20Abi = [
     stateMutability: 'view',
     inputs: [{ name: 'account', type: 'address' }],
     outputs: [{ type: 'uint256' }],
+  },
+] as const;
+
+// Adaptive Curve IRM: per-market rate at target utilization (per-second, WAD). Signed on
+// chain (int256) but always positive in practice. Bands mode reads it as the anchor rate.
+const irmAbi = [
+  {
+    name: 'rateAtTarget',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'id', type: 'bytes32' }],
+    outputs: [{ type: 'int256' }],
   },
 ] as const;
 
@@ -355,76 +389,6 @@ const safeAbi = [
 // ============ HELPERS ============
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
-
-function encodeMarketParams(market: MarketConfig): Hex {
-  // MarketParams struct: (loanToken, collateralToken, oracle, irm, lltv)
-  // This matches the Solidity struct encoding
-  const encoded = encodeFunctionData({
-    abi: [{
-      name: 'encode',
-      type: 'function',
-      inputs: [{
-        name: 'params',
-        type: 'tuple',
-        components: [
-          { name: 'loanToken', type: 'address' },
-          { name: 'collateralToken', type: 'address' },
-          { name: 'oracle', type: 'address' },
-          { name: 'irm', type: 'address' },
-          { name: 'lltv', type: 'uint256' },
-        ],
-      }],
-      outputs: [],
-    }],
-    functionName: 'encode',
-    args: [{
-      loanToken: USDS,
-      collateralToken: market.collateral,
-      oracle: market.oracle,
-      irm: IRM_ADAPTIVE,
-      lltv: market.lltv,
-    }],
-  });
-
-  // Remove the function selector (first 4 bytes / 10 hex chars including 0x)
-  return `0x${encoded.slice(10)}` as Hex;
-}
-
-function computeMarketId(market: MarketConfig): Hex {
-  const encoded = encodeAbiParameters(
-    [
-      { name: 'loanToken', type: 'address' },
-      { name: 'collateralToken', type: 'address' },
-      { name: 'oracle', type: 'address' },
-      { name: 'irm', type: 'address' },
-      { name: 'lltv', type: 'uint256' },
-    ],
-    [USDS, market.collateral, market.oracle, IRM_ADAPTIVE, market.lltv],
-  );
-  return keccak256(encoded);
-}
-
-/**
- * Compute the vault's relative-cap id for a market's collateral token.
- * Mirrors the on-chain derivation keccak256(abi.encode("collateralToken", collateral))
- * used when the caps were configured (see test/flagship/DeployFlagshipScript.t.sol).
- */
-function computeCollateralCapId(market: MarketConfig): Hex {
-  const encoded = encodeAbiParameters(
-    [{ type: 'string' }, { type: 'address' }],
-    ['collateralToken', market.collateral],
-  );
-  return keccak256(encoded);
-}
-
-/**
- * Compute the vault's relative-cap id for the adapter itself (the aggregate cap covering
- * everything the adapter allocates). Mirrors keccak256(abi.encode("this", adapter)) used
- * at configuration time (see test/flagship/DeployFlagshipScript.t.sol).
- */
-function computeAdapterCapId(adapter: Address): Hex {
-  return keccak256(encodeAbiParameters([{ type: 'string' }, { type: 'address' }], ['this', adapter]));
-}
 
 function log(message: string, data?: unknown) {
   const timestamp = new Date().toISOString();
@@ -518,9 +482,239 @@ async function executeSafeTransaction(
 
 // ============ MAIN ALLOCATOR LOGIC ============
 
+interface BandPlan {
+  targetAmounts: bigint[];              // reconciled absolute vault target per market
+  utilByIndex: (number | undefined)[];  // band each drain is held to (withdrawal clamp)
+  drainToZeroByIndex: boolean[];        // zero-cap drains bypass the executor's dust floor
+  pinnedTotalAssets: bigint;            // the snapshot the targets were computed from
+  pinnedPerMarketAssets: bigint[];
+  pinnedBlockNumber: bigint;            // for the pre-execution reorg check
+  pinnedBlockHash: Hex;
+}
+
+/**
+ * Bands mode: pinned-snapshot reads -> band decisions (band-controller.ts) ->
+ * vault-level reconciliation (reconcile.ts). Logs the BAND_TRACE line. Returns the
+ * reconciled plan, or null when every leg reconciled to zero (nothing to do).
+ */
+async function computeBandPlan(
+  publicClient: ReturnType<typeof createPublicClient>,
+  configuredMarkets: typeof markets,
+  marketIds: Hex[],
+): Promise<BandPlan | null> {
+  const cfg = bandConfig!; // parsed at module load whenever allocationMode === 'bands'
+
+  // Pin every steering read to one block for a consistent snapshot (same pattern as
+  // optimize.ts): market totals, anchor rates, caps, SSR, the vault's totalAssets and
+  // the adapter's per-market positions must all describe the same instant, or the band
+  // inversion (targetVault = vaultAssets + targetSupplyTotal - totalSupplyAssets) mixes
+  // snapshots and mis-sizes actions by whatever lands between the reads.
+  const block = await publicClient.getBlock();
+  const at = { blockNumber: block.number } as const;
+  const nowSec = Number(block.timestamp);
+
+  const [marketStatesRaw, ratesAtTarget, collateralCapsWad, ssrRay, pinnedTotalAssets, pinnedPerMarketAssets, pinnedAdapterAssets] = await Promise.all([
+    Promise.all(marketIds.map(id =>
+      publicClient.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: 'market', args: [id], ...at }))),
+    Promise.all(marketIds.map(id =>
+      publicClient.readContract({ address: IRM_ADAPTIVE, abi: irmAbi, functionName: 'rateAtTarget', args: [id], ...at }))),
+    Promise.all(configuredMarkets.map(m =>
+      publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'relativeCap', args: [computeCollateralCapId(m)], ...at }))),
+    publicClient.readContract({ address: SUSDS, abi: susdsAbi, functionName: 'ssr', ...at }),
+    publicClient.readContract({ address: config.vaultAddress, abi: vaultAbi, functionName: 'totalAssets', ...at }),
+    Promise.all(marketIds.map(id =>
+      publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'expectedSupplyAssets', args: [id], ...at }))),
+    publicClient.readContract({ address: config.adapterAddress, abi: adapterAbi, functionName: 'realAssets', ...at }),
+  ]);
+
+  // Every adapter dollar must be visible to the plan: if the adapter's total assets
+  // and the sum of the configured markets' positions disagree beyond dust, some
+  // position lives in a market this config cannot address (wrong ORACLE_*, missing
+  // market row) — steering and sleeve accounting would silently ignore it. Abort.
+  const visibleAssets = pinnedPerMarketAssets.reduce((sum, x) => sum + x, 0n);
+  const unaccounted = pinnedAdapterAssets > visibleAssets
+    ? pinnedAdapterAssets - visibleAssets
+    : visibleAssets - pinnedAdapterAssets;
+  if (unaccounted > config.minAllocationAmount) {
+    throw new Error(
+      `adapter.realAssets ${formatEther(pinnedAdapterAssets)} USDS differs from the sum of configured ` +
+      `market positions ${formatEther(visibleAssets)} USDS by ${formatEther(unaccounted)} USDS — ` +
+      `a position is invisible to this config (check ORACLE_* / market table). Refusing to steer.`
+    );
+  }
+
+  // SSR sanity: abort the run entirely when the read APY falls outside the configured
+  // bounds — a bad oracle/RPC value must not steer funds.
+  const ssrApy = computeSsrApy(ssrRay);
+  assertSsrSane(ssrApy, cfg);
+  log(`SSR APY: ${(ssrApy * 100).toFixed(3)}% (ssr ray ${ssrRay})`);
+
+  // Last bot action per market from Morpho Blue Supply/Withdraw events (onBehalf =
+  // adapter), feeding the 24h direction-change cooldown. fetchActionHistory THROWS on
+  // any RPC failure, aborting the cycle — steering blind to recent actions could
+  // ping-pong funds across the cooldown.
+  const fromBlock = block.number > BigInt(config.cooldownLookbackBlocks)
+    ? block.number - BigInt(config.cooldownLookbackBlocks)
+    : 0n;
+  // Cast per ActionHistoryClient's contract: any viem PublicClient satisfies the
+  // structural subset, but the generic getLogs signatures don't unify nominally.
+  const history = await fetchActionHistory(publicClient as unknown as ActionHistoryClient, {
+    morphoBlue: MORPHO_BLUE,
+    adapter: config.adapterAddress,
+    marketIds,
+    fromBlock,
+    toBlock: block.number,
+  });
+
+  // Accrue each market to the pinned block's timestamp via the blue-sdk Market, which
+  // also advances rateAtTarget per the Adaptive Curve IRM. Same construction as
+  // optimizer-logic's toSdkMarket (module-private there, so restated here).
+  // rateAtTarget is optional on the SDK type but always defined here: each Market is
+  // constructed with it and accrueInterest carries the end rate forward.
+  const accruedMarkets = configuredMarkets.map((m, i) => {
+    const [totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, lastUpdate, fee] = marketStatesRaw[i];
+    return new Market({
+      params: new MarketParams({ loanToken: USDS, collateralToken: m.collateral, oracle: m.oracle, irm: IRM_ADAPTIVE, lltv: m.lltv }),
+      totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares,
+      lastUpdate, fee,
+      rateAtTarget: ratesAtTarget[i],
+    }).accrueInterest(block.timestamp);
+  });
+  const observations: MarketObservation[] = configuredMarkets.map((m, i) => {
+    const hist = history.get(marketIds[i].toLowerCase());
+    return {
+      index: i,
+      name: m.name,
+      mode: m.mode,
+      ssrTMarginBps: m.ssrTMarginBps,
+      totalSupplyAssets: accruedMarkets[i].totalSupplyAssets,
+      totalBorrowAssets: accruedMarkets[i].totalBorrowAssets,
+      vaultAssets: pinnedPerMarketAssets[i],
+      anchorApy: anchorPerSecWadToApy(accruedMarkets[i].rateAtTarget!),
+      ...bandsCaps(m, pinnedTotalAssets, collateralCapsWad[i]),
+      lastAllocateAtSec: hist?.lastAllocateAtSec,
+      lastDeallocateAtSec: hist?.lastDeallocateAtSec,
+    };
+  });
+
+  const decisions: BandDecision[] = computeBandDecisions({
+    markets: observations, cfg, ssrApy, nowSec, liquidityReservePercent: LIQUIDITY_RESERVE_PERCENT,
+  });
+
+  // Re-index decisions by market position, failing loud on gaps or duplicates — a
+  // malformed decision vector must never silently leave a market unsteered.
+  const decisionByIndex = new Array<BandDecision>(configuredMarkets.length);
+  const seen = new Set<number>();
+  for (const d of decisions) {
+    if (d.index < 0 || d.index >= configuredMarkets.length || seen.has(d.index)) {
+      throw new Error(`computeBandDecisions returned an invalid or duplicate market index: ${d.index}`);
+    }
+    seen.add(d.index);
+    decisionByIndex[d.index] = d;
+  }
+  if (seen.size !== configuredMarkets.length) {
+    throw new Error(`computeBandDecisions returned ${seen.size} decisions for ${configuredMarkets.length} markets`);
+  }
+
+  // Reconcile the per-market wishes against the vault-level sleeve limits on the same
+  // pinned snapshot the wishes were computed from. The sleeve cap mirrors the vault's
+  // 20% aggregate adapter cap (config.targetAllocatedPercent); the floor comes from
+  // SLEEVE_FLOOR_BPS. (Downstream, capAllocationsToBudget re-clamps allocations to the
+  // room ACTUALLY freed by this batch's deallocations, so a withdrawal shrunk by fresh
+  // liquidity cannot push the sleeve past the on-chain cap.)
+  const sleeveUsds = visibleAssets;
+  const reconcileInputs: ReconcileMarket[] = configuredMarkets.map(
+    (m, i) => toReconcileMarket(m, observations[i], decisionByIndex[i], cfg));
+  const legs = reconcileToVaultLimits({
+    markets: reconcileInputs,
+    sleeveUsds,
+    totalAssets: pinnedTotalAssets,
+    sleeveFloorBps: cfg.sleeveFloorBps,
+    sleeveCapBps: config.targetAllocatedPercent,
+    minActionUsds: cfg.minBandActionUsds,
+    floorMarginUsds: FLOOR_LANDING_MARGIN_USDS,
+  });
+
+  // A/B borrower-reaction bracket (LOG-ONLY, no veto): for each market with an
+  // action, project the anchor 24h ahead as if utilization held at the post-trade
+  // level. simulateAnchor takes explicit segments and must not merge/split them (wExp
+  // drift is segmentation-dependent); one 24h segment IS this bracket's definition.
+  // postTradeUtilizationWad clamps the projection into [0, WAD]: a cap- or floor-forced
+  // drain can exceed the pool's idle liquidity, pushing the RAW post-trade util past
+  // 100%, but the real withdraw is liquidity-capped — and a diagnostics-only bracket
+  // must never be able to abort the cycle (simulateAnchor throws outside [0, WAD]).
+  const bigintsAsStrings = (_: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
+  const bracket = legs
+    .filter(leg => leg.delta !== 0n)
+    .map(leg => {
+      const obs = observations[leg.index];
+      const postSupply = obs.totalSupplyAssets + leg.delta;
+      const postUtilWad = postTradeUtilizationWad(postSupply, obs.totalBorrowAssets);
+      const projectedPerSecWad = simulateAnchor(
+        accruedMarkets[leg.index].rateAtTarget!,
+        [{ utilizationWad: postUtilWad, durationSec: 86400n }],
+      );
+      return {
+        index: leg.index,
+        name: obs.name,
+        postTradeUtilWad: postUtilWad,
+        anchorApyNow: obs.anchorApy,
+        anchorApyIn24h: anchorPerSecWadToApy(projectedPerSecWad),
+      };
+    });
+
+  // Full decision trace as one grep-able JSON line. configSha256 fingerprints the
+  // PARSED BandConfig (not raw env), so any effective-parameter change shows up.
+  const configSha256 = createHash('sha256').update(JSON.stringify(cfg, bigintsAsStrings)).digest('hex');
+  console.log('BAND_TRACE ' + JSON.stringify({
+    block: block.number,
+    ts: block.timestamp,
+    ssrApy,
+    configSha256,
+    decisions: decisions.map(d => ({
+      index: d.index,
+      name: observations[d.index].name,
+      rule: d.rule,
+      priority: d.priority,
+      reasons: d.reasons,
+      targetAmount: d.targetAmount,
+      bandUtilBps: d.bandUtilBps,
+      marketCap: observations[d.index].marketCap,
+      effectiveCap: observations[d.index].effectiveCap,
+    })),
+    reconciled: legs.map(leg => ({
+      index: leg.index,
+      name: observations[leg.index].name,
+      delta: leg.delta,
+      note: leg.note,
+    })),
+    bracket,
+  }, bigintsAsStrings));
+
+  // Reconciliation already dropped every leg below the min action, so "anything left
+  // to do?" is just "any non-zero leg".
+  if (legs.every(leg => leg.delta === 0n)) return null;
+
+  const targetAmounts = new Array<bigint>(configuredMarkets.length);
+  const utilByIndex = new Array<number | undefined>(configuredMarkets.length);
+  const drainToZeroByIndex = new Array<boolean>(configuredMarkets.length);
+  for (const leg of legs) {
+    targetAmounts[leg.index] = pinnedPerMarketAssets[leg.index] + leg.delta;
+    utilByIndex[leg.index] = decisionByIndex[leg.index].bandUtilBps;
+    drainToZeroByIndex[leg.index] = isDrainToZero(decisionByIndex[leg.index], observations[leg.index]);
+  }
+  if (block.hash === null) {
+    throw new Error('pinned block has no hash — cannot arm the pre-execution reorg check');
+  }
+  return {
+    targetAmounts, utilByIndex, drainToZeroByIndex, pinnedTotalAssets, pinnedPerMarketAssets,
+    pinnedBlockNumber: block.number, pinnedBlockHash: block.hash,
+  };
+}
+
 async function main() {
   log('=== Flagship Vault Allocator Bot ===');
-  log(`Mode: ${config.dryRun ? 'DRY RUN' : 'LIVE'}`);
+  log(`Mode: ${config.dryRun ? 'DRY RUN' : 'LIVE'} | allocation mode: ${allocationMode}`);
 
   // Validate configuration
   if (!config.privateKey) {
@@ -552,6 +746,19 @@ async function main() {
   log(`Safe multisig address: ${config.safeAddress}`);
   log(`Vault address: ${config.vaultAddress}`);
   log(`Adapter address: ${config.adapterAddress}`);
+
+  // Pending-nonce guard: if the bot EOA still has a transaction in flight from a previous
+  // run (pending nonce ahead of latest), submitting another would stack behind or replace
+  // it. Fail loud; the next cron cycle retries once the mempool clears.
+  const [pendingNonce, latestNonce] = await Promise.all([
+    publicClient.getTransactionCount({ address: account.address, blockTag: 'pending' }),
+    publicClient.getTransactionCount({ address: account.address, blockTag: 'latest' }),
+  ]);
+  if (pendingNonce > latestNonce) {
+    throw new Error(
+      `previous tx in flight: bot EOA ${account.address} pending nonce ${pendingNonce} > latest ${latestNonce}`
+    );
+  }
 
   // Verify bot is an owner of the Safe
   const isOwner = await publicClient.readContract({
@@ -617,29 +824,33 @@ async function main() {
       : 0,
   });
 
-  // Calculate target allocations
-  const targetTotalAllocated = (totalAssets * BigInt(config.targetAllocatedPercent)) / 10000n;
+  // Static bps targets are meaningful only in bps mode; bands mode logs its decision
+  // inputs and rules via the BAND_TRACE line further down instead.
+  if (allocationMode === 'bps') {
+    // Calculate target allocations
+    const targetTotalAllocated = (totalAssets * BigInt(config.targetAllocatedPercent)) / 10000n;
 
-  log('Target allocations:', {
-    targetTotalAllocated: formatEther(targetTotalAllocated),
-    targetIdlePercent: config.targetIdlePercent / 100,
-    perMarketTargetsBps: markets.map(m => `${m.name}: ${m.targetBps}`),
-  });
+    log('Target allocations:', {
+      targetTotalAllocated: formatEther(targetTotalAllocated),
+      targetIdlePercent: config.targetIdlePercent / 100,
+      perMarketTargetsBps: markets.map(m => `${m.name}: ${m.targetBps}`),
+    });
 
-  // Aggregate deviation is informational only. We deliberately do NOT short-circuit
-  // on it: with asymmetric per-market targets (e.g. migrating 5/5/5/5 → 0/10/10/0),
-  // the aggregate allocated can match targetAllocatedPercent exactly while individual
-  // markets are far off target. The per-market decision (and threshold short-circuit)
-  // lives in computeAllocationActions below, which is the single source of truth.
-  const allocationDiff = adapterAssets > targetTotalAllocated
-    ? adapterAssets - targetTotalAllocated
-    : targetTotalAllocated - adapterAssets;
+    // Aggregate deviation is informational only. We deliberately do NOT short-circuit
+    // on it: with asymmetric per-market targets (e.g. migrating 5/5/5/5 → 0/10/10/0),
+    // the aggregate allocated can match targetAllocatedPercent exactly while individual
+    // markets are far off target. The per-market decision (and threshold short-circuit)
+    // lives in computeAllocationActions below, which is the single source of truth.
+    const allocationDiff = adapterAssets > targetTotalAllocated
+      ? adapterAssets - targetTotalAllocated
+      : targetTotalAllocated - adapterAssets;
 
-  const aggregateDeviationBps = totalAssets > 0n
-    ? Number((allocationDiff * 10000n) / totalAssets)
-    : 0;
+    const aggregateDeviationBps = totalAssets > 0n
+      ? Number((allocationDiff * 10000n) / totalAssets)
+      : 0;
 
-  log(`Aggregate deviation: ${aggregateDeviationBps / 100}% (per-market threshold: ${config.rebalanceThresholdBps / 100}%)`);
+    log(`Aggregate deviation: ${aggregateDeviationBps / 100}% (per-market threshold: ${config.rebalanceThresholdBps / 100}%)`);
+  }
 
   // Read per-market allocations from the adapter. The target-sum invariant is
   // validated once at module load (see validateTargetBpsSum above).
@@ -668,11 +879,14 @@ async function main() {
   // operates on the oracle-configured subset. If those targets don't sum to the overall
   // allocated target, the difference stays idle — quantify the shortfall so the gap the
   // oracle warning describes is visible as a number, not just a list of markets.
-  const configuredTargetSum = configuredMarkets.reduce((sum, m) => sum + m.targetBps, 0);
-  if (configuredTargetSum !== config.targetAllocatedPercent) {
-    log(`WARNING: oracle-configured markets' targets sum to ${configuredTargetSum} bps, but ` +
-        `targetAllocatedPercent is ${config.targetAllocatedPercent} bps — ` +
-        `${config.targetAllocatedPercent - configuredTargetSum} bps (of totalAssets) will remain unallocated.`);
+  // (bps mode only: bands mode has no static target sum to compare against.)
+  if (allocationMode === 'bps') {
+    const configuredTargetSum = configuredMarkets.reduce((sum, m) => sum + m.targetBps, 0);
+    if (configuredTargetSum !== config.targetAllocatedPercent) {
+      log(`WARNING: oracle-configured markets' targets sum to ${configuredTargetSum} bps, but ` +
+          `targetAllocatedPercent is ${config.targetAllocatedPercent} bps — ` +
+          `${config.targetAllocatedPercent - configuredTargetSum} bps (of totalAssets) will remain unallocated.`);
+    }
   }
 
   const marketIds = configuredMarkets.map(m => computeMarketId(m));
@@ -692,6 +906,19 @@ async function main() {
     log(`  ${configuredMarkets[i].name}: ${formatEther(perMarketAssets[i])} USDS`);
   }
 
+  // ---- Bands mode: pinned-snapshot reads -> band decisions -> vault-level
+  // reconciliation (computeBandPlan). bps mode leaves the plan undefined and the
+  // legacy static-target path below runs unchanged. ----
+  let bandPlan: BandPlan | undefined;
+  if (allocationMode === 'bands') {
+    const plan = await computeBandPlan(publicClient, configuredMarkets, marketIds);
+    if (plan === null) {
+      log('No band actions needed (all wishes reconciled to holds)');
+      return;
+    }
+    bandPlan = plan;
+  }
+
   // Compute effective per-market target AMOUNTS. This applies PT-sUSDS's 5M absolute cap and
   // redistributes any overflow equally to the overflowReceiver markets (cbBTC, wstETH), so the
   // targets can't be expressed as static bps once the cap binds. computeAllocationActions
@@ -705,19 +932,33 @@ async function main() {
 
   const cappedMarkets = configuredMarkets.filter(m =>
     m.absoluteCap !== undefined && (totalAssets * BigInt(m.targetBps)) / 10000n > m.absoluteCap);
-  if (cappedMarkets.length > 0) {
+  if (allocationMode === 'bps' && cappedMarkets.length > 0) {
     log('Effective targets (absolute cap applied, overflow redistributed):',
       configuredMarkets.map((m, i) => `${m.name}: ${formatEther(effectiveTargetAmounts[i])} USDS`));
   }
 
-  // Compute per-market allocation/deallocation actions
+  // Compute per-market allocation/deallocation actions.
+  // bands mode sweeps only a zero-cap market's drain (it must end holding nothing) — an
+  // explicit vector, because undefined would fall back to the legacy "targetBps === 0
+  // means sweep" inference and drain markets the band decisions chose to leave alone.
+  // bps mode keeps the legacy inference.
+  const sweepByIndex = bandPlan?.drainToZeroByIndex;
   const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
-    totalAssets,
-    perMarketAssets,
+    // bands mode: act on the SAME pinned snapshot the reconciled targets were computed
+    // from — mixing the earlier 'latest' reads with pinned targets would let read drift
+    // between the two batches fabricate or resize actions (the threshold gate is 0 here,
+    // so even dust-level drift on a zero-delta leg would become an on-chain action).
+    totalAssets: bandPlan?.pinnedTotalAssets ?? totalAssets,
+    perMarketAssets: bandPlan?.pinnedPerMarketAssets ?? perMarketAssets,
     targetPerMarketBpsByIndex,
-    targetPerMarketAmountsByIndex: effectiveTargetAmounts,
-    rebalanceThresholdBps: config.rebalanceThresholdBps,
+    // bands mode: absolute per-market targets from the reconciled band plan.
+    // bps mode: bps-derived amounts with PT-sUSDS's absolute cap redistributed.
+    targetPerMarketAmountsByIndex: bandPlan?.targetAmounts ?? effectiveTargetAmounts,
+    sweepByIndex,
+    // bands mode already gated on "any target beyond the dust floor" above, so the bps
+    // deviation threshold is disabled there.
+    rebalanceThresholdBps: allocationMode === 'bands' ? 0 : config.rebalanceThresholdBps,
     // Sweep retired (target-0) markets down to the dust floor even when their deviation
     // is below the bps threshold, so leftover funds are returned to the vault rather than
     // stranded just under the rebalance threshold.
@@ -748,6 +989,9 @@ async function main() {
   const freshExpectedByIndex = new Map<number, bigint>();
   // On-chain relative cap (WAD) per allocate market's collateral, to clamp allocations.
   const onchainRelativeCapWadByIndex = new Map<number, bigint>();
+  // On-chain absolute cap (asset units) per allocate market's collateral. Only bands mode
+  // uses it, as a live deposit ceiling; the env cap stays the breach line.
+  const onchainAbsoluteCapByIndex = new Map<number, bigint>();
   let freshTotalAssets = totalAssets;
   let freshAdapterAssets = adapterAssets;
   // Effective headroom under the vault's AGGREGATE adapter cap (e.g. 20%), with headroom.
@@ -757,7 +1001,7 @@ async function main() {
   if (allocateActions.length > 0) {
     const allocateMarketIds = allocateActions.map(a => computeMarketId(configuredMarkets[a.marketIndex]));
     const allocateCapIds = allocateActions.map(a => computeCollateralCapId(configuredMarkets[a.marketIndex]));
-    const [freshTotal, freshAdapter, adapterRelativeCapWad, freshExpected, relativeCaps] = await Promise.all([
+    const [freshTotal, freshAdapter, adapterRelativeCapWad, freshExpected, relativeCaps, absoluteCaps] = await Promise.all([
       publicClient.readContract({
         address: config.vaultAddress,
         abi: vaultAbi,
@@ -790,6 +1034,14 @@ async function main() {
           args: [id],
         }),
       )),
+      Promise.all(allocateCapIds.map(id =>
+        publicClient.readContract({
+          address: config.vaultAddress,
+          abi: vaultAbi,
+          functionName: 'absoluteCap',
+          args: [id],
+        }),
+      )),
     ]);
     freshTotalAssets = freshTotal;
     freshAdapterAssets = freshAdapter;
@@ -798,6 +1050,7 @@ async function main() {
     allocateActions.forEach((a, i) => {
       freshExpectedByIndex.set(a.marketIndex, freshExpected[i]);
       onchainRelativeCapWadByIndex.set(a.marketIndex, relativeCaps[i]);
+      onchainAbsoluteCapByIndex.set(a.marketIndex, absoluteCaps[i]);
     });
   }
 
@@ -810,12 +1063,35 @@ async function main() {
   const freshEffectiveTargets = computeEffectiveTargetAmounts(freshTotalAssets, targetSpecs);
   const allocateCapInfo = allocateActions.map(a => {
     const market = configuredMarkets[a.marketIndex];
-    const targetAmount = freshEffectiveTargets[a.marketIndex];
     const onchainCapWad = onchainRelativeCapWadByIndex.get(a.marketIndex);
     const onchainCapLimit = onchainCapWad !== undefined
       ? computeCapLimit(freshTotalAssets, onchainCapWad)
-      : targetAmount;
-    const capLimit = onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
+      : undefined;
+    if (bandPlan !== undefined) {
+      // bands mode: the reconciled leg is the plan authority — the controller sized the
+      // target against the pinned cap with headroom already, so only the LIVE cap may
+      // shrink the allocate here (see bandsAllocateCeiling for why not the target again).
+      const targetAmount = bandPlan.targetAmounts[a.marketIndex];
+      const liveCapWithHeadroom = onchainCapLimit === undefined
+        ? undefined
+        : onchainCapLimit - onchainCapLimit * CAP_HEADROOM_BPS / 10000n;
+      const onchainAbsoluteCap = onchainAbsoluteCapByIndex.get(a.marketIndex);
+      const liveAbsoluteCapWithHeadroom = onchainAbsoluteCap === undefined ? undefined : withCapHeadroom(onchainAbsoluteCap);
+      const { ceiling, clampedByLiveCap } = bandsAllocateCeiling({
+        targetAmount,
+        pinnedAssets: bandPlan.pinnedPerMarketAssets[a.marketIndex],
+        freshExpected: freshExpectedByIndex.get(a.marketIndex)!,
+        liveCapWithHeadroom,
+        liveAbsoluteCapWithHeadroom,
+      });
+      // Which live cap the ceiling landed on, for the warning below (a tie names the absolute cap).
+      const clampedBy = !clampedByLiveCap ? undefined : ceiling === liveAbsoluteCapWithHeadroom ? 'absolute' : 'relative';
+      return { marketIndex: a.marketIndex, market, effectiveCap: ceiling, onchainCapWad, onchainAbsoluteCap, targetAmount, clamped: clampedByLiveCap, clampedBy };
+    }
+    // bps mode (decision-identical rollback): the bps target recomputed against fresh
+    // totalAssets, clamped to the live cap, with headroom on the result — as before.
+    const targetAmount = freshEffectiveTargets[a.marketIndex];
+    const capLimit = onchainCapLimit !== undefined && onchainCapLimit < targetAmount ? onchainCapLimit : targetAmount;
     const effectiveCap = capLimit - capLimit * CAP_HEADROOM_BPS / 10000n;
     return {
       marketIndex: a.marketIndex,
@@ -823,18 +1099,22 @@ async function main() {
       effectiveCap,
       onchainCapWad,
       targetAmount,
-      clamped: onchainCapLimit < targetAmount,
+      clamped: onchainCapLimit !== undefined && onchainCapLimit < targetAmount,
     };
   });
 
-  // Warn when a market's on-chain relative cap is below its target — allocations are
+  // Warn when a market's live on-chain cap is below its target — allocations are
   // clamped to the live cap, so the market can't reach target until the cap is raised.
   for (const info of allocateCapInfo) {
     if (info.clamped) {
       const onchainBps = info.onchainCapWad !== undefined ? Number((info.onchainCapWad * 10000n) / 10n ** 18n) : 0;
-      log(`WARNING: ${info.market.name} on-chain relative cap is ${onchainBps} bps but effective target is ` +
+      // bps mode only ever clamps to the relative cap; bands mode reports which one bound.
+      const [capLine, raiseFn] = info.clampedBy === 'absolute'
+        ? [`on-chain absolute cap is ${formatEther(info.onchainAbsoluteCap!)} USDS`, 'increaseAbsoluteCap']
+        : [`on-chain relative cap is ${onchainBps} bps`, 'increaseRelativeCap'];
+      log(`WARNING: ${info.market.name} ${capLine} but effective target is ` +
           `${formatEther(info.targetAmount)} USDS (${info.market.targetBps} bps base) — allocations are clamped ` +
-          `to the on-chain cap. Raise the cap (increaseRelativeCap) to reach target.`);
+          `to the on-chain cap. Raise the cap (${raiseFn}) to reach target.`);
     }
   }
 
@@ -857,13 +1137,17 @@ async function main() {
 
     const marketLiquidityData: MarketLiquidity[] = deallocateActions.map((a, i) => {
       const [totalSupplyAssets, , totalBorrowAssets] = marketStates[i];
-      // WETH/USDS (and any market with maxUtilizationBps set) is drained only up to its target
-      // utilization (93%), waiting above it; others use the flat supply-reserve cushion.
+      // bps mode: WETH/USDS (and any market with maxUtilizationBps set) is drained only up
+      // to its target utilization (93%), waiting above it; others use the flat
+      // supply-reserve cushion. bands mode: the band decision's hold utilization bounds the
+      // drain instead; an undefined bandUtilBps keeps the flat cushion.
       return {
         marketIndex: a.marketIndex,
         totalSupplyAssets,
         totalBorrowAssets,
-        maxUtilizationBps: configuredMarkets[a.marketIndex].maxUtilizationBps,
+        maxUtilizationBps: bandPlan !== undefined
+          ? bandPlan.utilByIndex[a.marketIndex]
+          : configuredMarkets[a.marketIndex].maxUtilizationBps,
       };
     });
 
@@ -872,7 +1156,7 @@ async function main() {
 
   // Build vault calls: deallocations first, then allocations
   // Order matters: deallocations free up idle balance for subsequent allocations
-  const vaultCalls: { name: string; action: string; amount: bigint; calldata: Hex }[] = [];
+  const vaultCalls: { marketIndex: number; name: string; action: 'allocate' | 'deallocate'; amount: bigint; calldata: Hex }[] = [];
 
   // Plan deallocations via the pure composition, then map outcomes -> log + on-chain call.
   // cappedDeallocations is capDeallocationsToLiquidity(deallocateActions), which maps 1:1
@@ -886,6 +1170,7 @@ async function main() {
     capped: c.capped,
     skipped: c.skipped,
     availableLiquidity: c.availableLiquidity,
+    sweep: sweepByIndex?.[c.marketIndex],
   }));
 
   // Deallocations execute first in the atomic batch, so by the time the allocations run the
@@ -907,6 +1192,7 @@ async function main() {
     }
     totalDeallocated += outcome.amount;
     vaultCalls.push({
+      marketIndex: outcome.marketIndex,
       name: market.name,
       action: 'deallocate',
       amount: outcome.amount,
@@ -944,7 +1230,11 @@ async function main() {
   // adapter is at/over cap the budget is ~0, so the bot just deallocates and grows next cycle.
   const allocationBudget = computeAllocationBudget(adapterAllocationCap, freshAdapterAssets, totalDeallocated);
   const plannedTotal = plannedAllocations.reduce((sum, a) => sum + a.amount, 0n);
-  const budgetedAllocations = capAllocationsToBudget(plannedAllocations, allocationBudget, config.minAllocationAmount);
+  // bands mode funds PRIMARY first: reconciliation served it before the band wishes, and a
+  // pro-rata cut here would hand its budget to STEERED markets. bps mode has no PRIMARY.
+  const primaryIndex = configuredMarkets.findIndex(m => m.mode === 'PRIMARY');
+  const priorityIndex = bandPlan !== undefined && primaryIndex >= 0 ? primaryIndex : undefined;
+  const budgetedAllocations = capAllocationsToBudget(plannedAllocations, allocationBudget, config.minAllocationAmount, priorityIndex);
   if (plannedTotal > allocationBudget) {
     log(`  Allocations limited by adapter cap: wanted ${formatEther(plannedTotal)}, budget ${formatEther(allocationBudget)} (adapter cap ${formatEther(adapterAllocationCap)}, adapter after deallocations ${formatEther(freshAdapterAssets - totalDeallocated)})`);
   }
@@ -952,6 +1242,7 @@ async function main() {
   for (const { marketIndex, amount } of budgetedAllocations) {
     const market = configuredMarkets[marketIndex];
     vaultCalls.push({
+      marketIndex,
       name: market.name,
       action: 'allocate',
       amount,
@@ -963,12 +1254,30 @@ async function main() {
     });
   }
 
+  // Bands mode: re-verify the FINAL batch against the reconciled legs before anything
+  // else sees it — every downstream stage may only shrink a leg, and the batch must
+  // keep the sleeve inside (or moving toward) the [floor, cap] band on the pinned
+  // snapshot. Any violation is a wiring bug or an anomalous read: abort with no tx.
+  if (bandPlan !== undefined) {
+    assertBandBatchSafe({
+      calls: vaultCalls.map((c): PlannedBatchCall => ({ marketIndex: c.marketIndex, action: c.action, amount: c.amount })),
+      legDeltas: configuredMarkets.map((_, i) => bandPlan!.targetAmounts[i] - bandPlan!.pinnedPerMarketAssets[i]),
+      pinnedPerMarketAssets: bandPlan.pinnedPerMarketAssets,
+      pinnedTotalAssets: bandPlan.pinnedTotalAssets,
+      sleeveFloorBps: bandConfig!.sleeveFloorBps,
+      sleeveCapBps: config.targetAllocatedPercent,
+      maxAllocateUsds: bandConfig!.maxAllocateUsds,
+      maxDeallocateUsds: bandConfig!.maxDeallocateUsds,
+      marketNames: configuredMarkets.map(m => m.name),
+    });
+  }
+
   if (vaultCalls.length === 0) {
     // Rebalancing WAS triggered (we passed computeAllocationActions' threshold gate) but
     // every action was dropped by liquidity caps, cap limits, or the dust filter. This is
     // an anomaly, not a clean "within threshold" no-op: the rebalance/migration may be
     // BLOCKED (e.g. illiquid markets that can't be drained). Surface it loudly so the
-    // 6-hourly cron doesn't silently spin forever without making progress.
+    // cron doesn't silently spin forever without making progress.
     log('WARNING: rebalancing was triggered but ALL actions were dropped (liquidity ' +
         'constraints, cap limits, or dust filter). The rebalance/migration may be BLOCKED — ' +
         'check market liquidity and oracle configuration.');
@@ -993,37 +1302,55 @@ async function main() {
     return;
   }
 
-  // Pack into MultiSend and execute as single Safe transaction
-  try {
-    const packed = packMultiSendTxs(vaultCalls.map(c => ({ to: config.vaultAddress, data: c.calldata })));
-    const multiSendData = encodeFunctionData({
-      abi: [{
-        name: 'multiSend',
-        type: 'function',
-        stateMutability: 'payable',
-        inputs: [{ name: 'transactions', type: 'bytes' }],
-        outputs: [],
-      }] as const,
-      functionName: 'multiSend',
-      args: [packed],
-    });
+  // Bands mode: the plan was computed on the pinned block — if a reorg replaced it,
+  // the snapshot no longer describes the chain this batch is about to trade on.
+  // Abort; the next cycle recomputes from scratch.
+  if (bandPlan !== undefined) {
+    const pinnedBlockNow = await publicClient.getBlock({ blockNumber: bandPlan.pinnedBlockNumber });
+    if (pinnedBlockNow.hash !== bandPlan.pinnedBlockHash) {
+      throw new Error(
+        `pinned block ${bandPlan.pinnedBlockNumber} was reorged ` +
+        `(${bandPlan.pinnedBlockHash} -> ${pinnedBlockNow.hash}) — aborting the cycle`
+      );
+    }
+  }
 
-    const hash = await executeSafeTransaction(
-      publicClient,
-      walletClient,
-      account,
-      config.safeAddress,
-      MULTISEND,
-      multiSendData,
-      1, // DELEGATECALL — MultiSend runs as Safe, so vault sees msg.sender = Safe
-    );
+  // Pack into MultiSend and execute as single Safe transaction. Deliberately NO
+  // try/catch: any execution failure (submit error, receipt timeout, revert) must
+  // propagate so the process exits non-zero and the cron surfaces it, rather than
+  // logging an error line and reporting success.
+  const packed = packMultiSendTxs(vaultCalls.map(c => ({ to: config.vaultAddress, data: c.calldata })));
+  const multiSendData = encodeFunctionData({
+    abi: [{
+      name: 'multiSend',
+      type: 'function',
+      stateMutability: 'payable',
+      inputs: [{ name: 'transactions', type: 'bytes' }],
+      outputs: [],
+    }] as const,
+    functionName: 'multiSend',
+    args: [packed],
+  });
 
-    log(`Transaction submitted via Safe: ${hash}`);
+  const hash = await executeSafeTransaction(
+    publicClient,
+    walletClient,
+    account,
+    config.safeAddress,
+    MULTISEND,
+    multiSendData,
+    1, // DELEGATECALL — MultiSend runs as Safe, so vault sees msg.sender = Safe
+  );
 
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    log(`Confirmed in block ${receipt.blockNumber}, status: ${receipt.status}`);
-  } catch (error) {
-    log(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
+  log(`Transaction submitted via Safe: ${hash}`);
+
+  // Bounded wait (RECEIPT_TIMEOUT_MS, default 5 min): a slow confirmation throws here
+  // and fails the run; the pending-nonce guard stops the next cycle from stacking a
+  // second tx behind the in-flight one.
+  const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: config.receiptTimeoutMs });
+  log(`Confirmed in block ${receipt.blockNumber}, status: ${receipt.status}`);
+  if (receipt.status !== 'success') {
+    throw new Error(`Safe transaction ${hash} reverted (status: ${receipt.status})`);
   }
 
   // Log final state
