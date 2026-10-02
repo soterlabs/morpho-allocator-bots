@@ -49,7 +49,7 @@ The bot allocates vault funds according to this strategy:
 The strategy above is the `bps` mode of a required `ALLOCATION_MODE` env
 (`bps` | `bands`, no default). In **bands** mode the static per-market bps
 targets are replaced by **satAPY band steering**: each STEERED market is held
-at 90 / 92 / 93 / 94 / 95% utilization depending on where its
+at 90 / 91 / 92 / 93 / 94 / 95% utilization depending on where its
 satAPY (= 0.9 x anchor) sits versus thresholds derived from
 SSR_t = SSR + `SSR_T_MARGIN_BPS` (0 by default; SSR read on-chain from
 `sUSDS.ssr()`), letting the Adaptive Curve IRM drift borrow rates toward the
@@ -61,7 +61,8 @@ with no action.
 |---|---|
 | 90% | above the zone (top up from idle as demand grows) |
 | hold | inside the zone [SSR_t - 25 bps, SSR_t + 25 bps] |
-| 92% | [2/3 x SSR_t, zone) |
+| 91% | [5/6 x SSR_t, zone) |
+| 92% | [2/3 x SSR_t, 5/6 x SSR_t) |
 | 93% | [1/3 x SSR_t, 2/3 x SSR_t) |
 | 94% | [1/12 x SSR_t, 1/3 x SSR_t) |
 | 95% | below 1/12 x SSR_t |

@@ -4,7 +4,8 @@ import { computeBandDecisions, type MarketObservation } from './band-controller.
 import { parseBandConfig } from './band-config.js';
 
 // Production rate shape: SSR 3.52% -> SSR_t = 3.77%, HOLD zone [3.52%, 4.02%],
-// band thresholds 2/3 x SSR_t = 2.513%, 1/3 x SSR_t = 1.257%, 1/12 x SSR_t = 0.314%.
+// band thresholds 5/6 x SSR_t = 3.142%, 2/3 x SSR_t = 2.513%, 1/3 x SSR_t = 1.257%,
+// 1/12 x SSR_t = 0.314%.
 const SSR_APY = 0.0352;
 // Derived exactly the way the controller derives it, so exact-at-threshold probes
 // share the controller's floating-point value bit for bit.
@@ -89,8 +90,16 @@ describe('the satAPY ladder off SSR_t', () => {
     expect(bandAt(0.0352)).toBe('HOLD');
   });
 
-  it('chooses band 92 just under the zone', () => {
-    expect(bandAt(0.0351)).toBe(9200);
+  it('chooses band 91 just under the zone', () => {
+    expect(bandAt(0.0351)).toBe(9100);
+  });
+
+  it('chooses band 91 at exactly 5/6 x SSR_t', () => {
+    expect(bandAt((5 / 6) * SSR_T)).toBe(9100);
+  });
+
+  it('chooses band 92 just below 5/6 x SSR_t (3.14%)', () => {
+    expect(bandAt(0.0314)).toBe(9200);
   });
 
   it('chooses band 92 at exactly 2/3 x SSR_t', () => {
@@ -428,24 +437,24 @@ describe('market modes', () => {
 describe('per-market SSR_t margin override', () => {
   it('lets a zero override move the zone below SSR (symmetric [SSR - 25, SSR + 25])', () => {
     // satAPY 3.40%: under the fixture's 25 bps margin the zone is [3.52%, 4.02%], so
-    // the market would steer to band 92; with a 0 bps override the zone is
+    // the market would steer to band 91; with a 0 bps override the zone is
     // [3.27%, 3.77%] and it holds — a rate slightly under SSR is accepted.
     const d = decide(market({ anchorApy: 0.034 / 0.9, ssrTMarginBps: 0 }));
 
     expect(d.rule).toBe('R-HOLD');
-    expect(decide(market({ anchorApy: 0.034 / 0.9 })).rule).toBe('R-BAND92');
+    expect(decide(market({ anchorApy: 0.034 / 0.9 })).rule).toBe('R-BAND91');
   });
 
   it('a higher per-market margin moves the zone up and turns a hold into steering', () => {
     // satAPY 3.906% holds under the global margin (zone tops at 4.02%), but with a
     // 100 bps override SSR_t = 4.52% and the zone becomes [4.27%, 4.77%]: 3.906%
-    // now sits above 2/3 x SSR_t = 3.01% -> band 92.
+    // now sits above 5/6 x SSR_t = 3.77% -> band 91.
     const global = decide(market({ anchorApy: 0.0434 }));
     const overridden = decide(market({ anchorApy: 0.0434, ssrTMarginBps: 100 }));
 
     expect(global.rule).toBe('R-HOLD');
-    expect(overridden.rule).toBe('R-BAND92');
-    expect(overridden.bandUtilBps).toBe(9200);
+    expect(overridden.rule).toBe('R-BAND91');
+    expect(overridden.bandUtilBps).toBe(9100);
   });
 });
 

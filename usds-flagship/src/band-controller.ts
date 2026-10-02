@@ -72,7 +72,7 @@ export interface MarketObservation {
 
 /** Machine-readable trace key for the decision a market ended on. */
 export type BandRule =
-  | 'R-BAND90' | 'R-BAND92' | 'R-BAND93' | 'R-BAND94' | 'R-BAND95'
+  | 'R-BAND90' | 'R-BAND91' | 'R-BAND92' | 'R-BAND93' | 'R-BAND94' | 'R-BAND95'
   | 'R-HOLD' | 'R-DEADBAND' | 'R-MINACTION' | 'R-COOLDOWN' | 'R-SHARE' | 'R-RETIRED'
   | 'R-PRIORITY-DEPOSIT' | 'R-PRIORITY-WITHDRAWAL';
 
@@ -128,10 +128,11 @@ function holdAt(m: MarketObservation, rule: BandRule, bandUtilBps: number | unde
   return { index: m.index, targetAmount: m.vaultAssets, bandUtilBps, priority: false, rule, reasons };
 }
 
-type BandUtil = 9000 | 9200 | 9300 | 9400 | 9500;
+type BandUtil = 9000 | 9100 | 9200 | 9300 | 9400 | 9500;
 
 const BAND_RULE: Record<BandUtil, BandRule> = {
-  9000: 'R-BAND90', 9200: 'R-BAND92', 9300: 'R-BAND93', 9400: 'R-BAND94', 9500: 'R-BAND95',
+  9000: 'R-BAND90', 9100: 'R-BAND91', 9200: 'R-BAND92',
+  9300: 'R-BAND93', 9400: 'R-BAND94', 9500: 'R-BAND95',
 };
 
 /**
@@ -141,6 +142,7 @@ const BAND_RULE: Record<BandUtil, BandRule> = {
  *
  *   satAPY >  SSR_t + tolerance   -> 9000  (rate rich — top up from idle as demand grows)
  *   satAPY >= SSR_t - tolerance   -> HOLD  (zone [SSR - 25, SSR + 25] bps at defaults)
+ *   satAPY >= 5/6  x SSR_t        -> 9100  (gentlest heating — a market just under the zone)
  *   satAPY >= 2/3  x SSR_t        -> 9200
  *   satAPY >= 1/3  x SSR_t        -> 9300
  *   satAPY >= 1/12 x SSR_t        -> 9400
@@ -149,6 +151,7 @@ const BAND_RULE: Record<BandUtil, BandRule> = {
 function pickBand(satApy: number, ssrTApy: number, toleranceApy: number): BandUtil | 'HOLD' {
   if (satApy > ssrTApy + toleranceApy) return 9000;
   if (satApy >= ssrTApy - toleranceApy) return 'HOLD';
+  if (satApy >= (5 / 6) * ssrTApy) return 9100;
   if (satApy >= (2 / 3) * ssrTApy) return 9200;
   if (satApy >= (1 / 3) * ssrTApy) return 9300;
   if (satApy >= (1 / 12) * ssrTApy) return 9400;
