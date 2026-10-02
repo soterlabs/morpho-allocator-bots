@@ -7,13 +7,13 @@ Authoritative env parsing: `usds-flagship/src/band-config.ts`
 ## What it does
 
 Instead of holding each market at a static bps target, the bot holds each
-market at a **utilization band** — 90 / 92 / 93 / 94 / 95% — chosen from the
+market at a **utilization band** — 90 / 91 / 92 / 93 / 94 / 95% — chosen from the
 market's satAPY against thresholds derived from the Sky Savings Rate. SSR is
 read on-chain from `sUSDS.ssr()`
 (`0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD`; per-second rate in RAY,
 `APY = (ssr / 1e27) ^ 31536000 − 1`). Because Morpho's Adaptive Curve IRM
 drifts its anchor (`rateAtTarget`) up whenever utilization is held above 90%,
-holding a cheap market at 92–95% steadily raises what borrowers pay, while a
+holding a cheap market at 91–95% steadily raises what borrowers pay, while a
 market that already pays its keep is topped up from idle at the 90% neutral
 point. The target amount for a market is the vault position that puts the
 market at its band: `targetSupplyTotal = ceil(borrow × 10000 / bandUtilBps)`.
@@ -44,7 +44,8 @@ rates.
 |---|---|---|
 | above the zone | **9000** (90%) | `R-BAND90` |
 | inside the zone | — no action | `R-HOLD` |
-| `[2/3 × SSR_t, zone)` | **9200** (92%) | `R-BAND92` |
+| `[5/6 × SSR_t, zone)` | **9100** (91%) | `R-BAND91` |
+| `[2/3 × SSR_t, 5/6 × SSR_t)` | **9200** (92%) | `R-BAND92` |
 | `[1/3 × SSR_t, 2/3 × SSR_t)` | **9300** (93%) | `R-BAND93` |
 | `[1/12 × SSR_t, 1/3 × SSR_t)` | **9400** (94%) | `R-BAND94` |
 | below `1/12 × SSR_t` | **9500** (95%) | `R-BAND95` |
