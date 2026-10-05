@@ -63,16 +63,17 @@ export interface MarketConfig {
   // band decision instead.
   maxUtilizationBps?: number;
   // Bands-mode role of this market (ALLOCATION_MODE=bands; bps mode rejects PRIMARY):
-  //   STEERED  — utilization-band rate steering toward the SSR floor
-  //   PRIMARY  — always asks for deposits up to its cap, served first (at most one)
+  //   STEERED  — held where its borrow rate meets SSR + margin (rate-target steering)
+  //   PRIMARY  — asks for deposits up to its cap (never under its own utilization
+  //              floor), served first (at most one)
   //   SOUNDING — reserved; configuring it refuses to start (parseMarketMode throws)
   //   RETIRED  — the bot never touches the market
   // From MODE_* env vars, validated against the enum (parseMarketMode throws on anything else).
   mode: MarketMode;
-  // Optional per-market SSR_t margin override (bps) for bands mode, from SSR_T_MARGIN_<MARKET>_BPS
-  // env vars. Unset = the market uses the global SSR_T_MARGIN_BPS. Lets PT-sUSDS and the
-  // bluechips carry different rate hurdles.
-  ssrTMarginBps?: number;
+  // Optional per-market rate-margin override (bps) for bands mode, from RATE_MARGIN_<MARKET>_BPS
+  // env vars: the market is aimed at SSR + this instead of SSR + the global RATE_MARGIN_BPS.
+  // Unset = global. Lets the bluechips carry different rate hurdles.
+  rateMarginBps?: number;
   encodedParams?: Hex;
 }
 
@@ -105,7 +106,7 @@ export function parseMarketMode(raw: string | undefined, defaultMode: MarketMode
 }
 
 /**
- * Parse an optional per-market bps env (SSR_T_MARGIN_<MARKET>_BPS, CAP_<MARKET>_BPS).
+ * Parse an optional per-market bps env (RATE_MARGIN_<MARKET>_BPS, CAP_<MARKET>_BPS).
  * Unset -> undefined, which each consumer resolves its own way (global margin fallback;
  * no share cap). Present values get the same strict whole-number [0, 10000] validation
  * as every other bps env (parseTargetBps); 0 is valid.
@@ -214,7 +215,7 @@ export const markets: MarketConfig[] = [
     lltv: BigInt(process.env.LLTV_STUSDS || LLTV_86_PERCENT),
     targetBps: parseTargetBps(process.env.TARGET_STUSDS_BPS, 0, 'TARGET_STUSDS_BPS'),
     mode: parseMarketMode(process.env.MODE_STUSDS, 'RETIRED', 'MODE_STUSDS'),
-    ssrTMarginBps: parseOptionalBps(process.env.SSR_T_MARGIN_STUSDS_BPS, 'SSR_T_MARGIN_STUSDS_BPS'),
+    rateMarginBps: parseOptionalBps(process.env.RATE_MARGIN_STUSDS_BPS, 'RATE_MARGIN_STUSDS_BPS'),
     capUsds: parseOptionalCapUsds(process.env.CAP_STUSDS_USDS, 'CAP_STUSDS_USDS'),
     capBps: parseOptionalBps(process.env.CAP_STUSDS_BPS, 'CAP_STUSDS_BPS'),
   },
@@ -226,7 +227,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_CBBTC_BPS, 667, 'TARGET_CBBTC_BPS'),
     overflowReceiver: true,
     mode: parseMarketMode(process.env.MODE_CBBTC, 'STEERED', 'MODE_CBBTC'),
-    ssrTMarginBps: parseOptionalBps(process.env.SSR_T_MARGIN_CBBTC_BPS, 'SSR_T_MARGIN_CBBTC_BPS'),
+    rateMarginBps: parseOptionalBps(process.env.RATE_MARGIN_CBBTC_BPS, 'RATE_MARGIN_CBBTC_BPS'),
     capUsds: parseOptionalCapUsds(process.env.CAP_CBBTC_USDS, 'CAP_CBBTC_USDS'),
     capBps: parseOptionalBps(process.env.CAP_CBBTC_BPS, 'CAP_CBBTC_BPS'),
   },
@@ -238,7 +239,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_WSTETH_BPS, 667, 'TARGET_WSTETH_BPS'),
     overflowReceiver: true,
     mode: parseMarketMode(process.env.MODE_WSTETH, 'STEERED', 'MODE_WSTETH'),
-    ssrTMarginBps: parseOptionalBps(process.env.SSR_T_MARGIN_WSTETH_BPS, 'SSR_T_MARGIN_WSTETH_BPS'),
+    rateMarginBps: parseOptionalBps(process.env.RATE_MARGIN_WSTETH_BPS, 'RATE_MARGIN_WSTETH_BPS'),
     capUsds: parseOptionalCapUsds(process.env.CAP_WSTETH_USDS, 'CAP_WSTETH_USDS'),
     capBps: parseOptionalBps(process.env.CAP_WSTETH_BPS, 'CAP_WSTETH_BPS'),
   },
@@ -250,7 +251,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_PTSUSDS_BPS, 666, 'TARGET_PTSUSDS_BPS'),
     absoluteCap: PT_SUSDS_ABSOLUTE_CAP,
     mode: parseMarketMode(process.env.MODE_PTSUSDS, 'STEERED', 'MODE_PTSUSDS'),
-    ssrTMarginBps: parseOptionalBps(process.env.SSR_T_MARGIN_PTSUSDS_BPS, 'SSR_T_MARGIN_PTSUSDS_BPS'),
+    rateMarginBps: parseOptionalBps(process.env.RATE_MARGIN_PTSUSDS_BPS, 'RATE_MARGIN_PTSUSDS_BPS'),
     capUsds: parseOptionalCapUsds(process.env.CAP_PTSUSDS_USDS, 'CAP_PTSUSDS_USDS'),
     capBps: parseOptionalBps(process.env.CAP_PTSUSDS_BPS, 'CAP_PTSUSDS_BPS'),
   },
@@ -262,7 +263,7 @@ export const markets: MarketConfig[] = [
     targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, 0, 'TARGET_WETH_BPS'),
     maxUtilizationBps: WETH_MAX_UTILIZATION_BPS,
     mode: parseMarketMode(process.env.MODE_WETH, 'RETIRED', 'MODE_WETH'),
-    ssrTMarginBps: parseOptionalBps(process.env.SSR_T_MARGIN_WETH_BPS, 'SSR_T_MARGIN_WETH_BPS'),
+    rateMarginBps: parseOptionalBps(process.env.RATE_MARGIN_WETH_BPS, 'RATE_MARGIN_WETH_BPS'),
     capUsds: parseOptionalCapUsds(process.env.CAP_WETH_USDS, 'CAP_WETH_USDS'),
     capBps: parseOptionalBps(process.env.CAP_WETH_BPS, 'CAP_WETH_BPS'),
   },

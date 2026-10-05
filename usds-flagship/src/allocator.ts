@@ -12,10 +12,12 @@
  *             equally between cbBTC and wstETH. WETH is drained only up to 93% market
  *             utilization (waits above it).
  *
- *   'bands' — satAPY band steering. Per-market targets come from computeBandDecisions
- *             (band-controller.ts): each STEERED market is held to a utilization band
- *             chosen from its satAPY vs thresholds derived from the on-chain SSR;
- *             RETIRED markets are never touched. The per-market wishes are then
+ *   'bands' — rate-target steering. Per-market targets come from computeBandDecisions
+ *             (band-controller.ts): each STEERED market is held at the utilization
+ *             where its borrow rate equals the on-chain SSR + RATE_MARGIN_BPS (the
+ *             Adaptive Curve IRM inverted around the anchor); the PRIMARY market is
+ *             filled to its cap but never under its own utilization floor; RETIRED
+ *             markets are never touched. The per-market wishes are then
  *             reconciled against the vault-level sleeve limits (reconcile.ts) before
  *             execution. The decision inputs and the resulting rules are logged as one
  *             BAND_TRACE JSON line per run, including a log-only 24h anchor-rate
@@ -45,7 +47,7 @@ import 'dotenv/config';
 import { computeAllocationActions, computeCapLimit, CAP_HEADROOM_BPS, withCapHeadroom, DUST_FLOOR_USDS, FLOOR_LANDING_MARGIN_USDS, LIQUIDITY_RESERVE_PERCENT, bandsAllocateCeiling, capDeallocationsToLiquidity, validateTargetBpsSum, computeEffectiveTargetAmounts, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type MarketTargetSpec, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 import { USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi, encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId, validateBandsMarkets, validateBpsMarkets } from './market-config.js';
 import { bandsCaps, isDrainToZero, toReconcileMarket } from './band-plan.js';
-import { parseBandConfig, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
+import { parseBandConfig, retiredBandEnvWarnings, computeSsrApy, assertSsrSane, type BandConfig } from './band-config.js';
 import { computeBandDecisions, type MarketObservation, type BandDecision } from './band-controller.js';
 import { reconcileToVaultLimits, type ReconcileMarket } from './reconcile.js';
 import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
@@ -143,6 +145,11 @@ const allocationMode: 'bps' | 'bands' = allocationModeRaw;
 // Bands mode: parse the full band-steering configuration up front (throws on any invalid
 // or missing-required value, e.g. MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS must be > 0).
 const bandConfig: BandConfig | undefined = allocationMode === 'bands' ? parseBandConfig(process.env) : undefined;
+if (allocationMode === 'bands') {
+  // Env left over from the retired satAPY ladder is ignored, never reinterpreted —
+  // but say so every run, so a stale value is not mistaken for a live knob.
+  for (const warning of retiredBandEnvWarnings(process.env)) log(`WARNING: ${warning}`);
+}
 
 if (allocationMode === 'bps') {
   // Fail fast on a misconfigured strategy: the per-market targets must sum to the
@@ -484,7 +491,7 @@ async function executeSafeTransaction(
 
 interface BandPlan {
   targetAmounts: bigint[];              // reconciled absolute vault target per market
-  utilByIndex: (number | undefined)[];  // band each drain is held to (withdrawal clamp)
+  utilByIndex: (number | undefined)[];  // target utilization each drain is held to (withdrawal clamp)
   drainToZeroByIndex: boolean[];        // zero-cap drains bypass the executor's dust floor
   pinnedTotalAssets: bigint;            // the snapshot the targets were computed from
   pinnedPerMarketAssets: bigint[];
@@ -586,7 +593,7 @@ async function computeBandPlan(
       index: i,
       name: m.name,
       mode: m.mode,
-      ssrTMarginBps: m.ssrTMarginBps,
+      rateMarginBps: m.rateMarginBps,
       totalSupplyAssets: accruedMarkets[i].totalSupplyAssets,
       totalBorrowAssets: accruedMarkets[i].totalBorrowAssets,
       vaultAssets: pinnedPerMarketAssets[i],
@@ -675,9 +682,12 @@ async function computeBandPlan(
       index: d.index,
       name: observations[d.index].name,
       rule: d.rule,
+      regime: d.regime,
       priority: d.priority,
       reasons: d.reasons,
       targetAmount: d.targetAmount,
+      targetRateApy: d.targetRateApy,
+      anchorApy: observations[d.index].anchorApy,
       bandUtilBps: d.bandUtilBps,
       marketCap: observations[d.index].marketCap,
       effectiveCap: observations[d.index].effectiveCap,
@@ -1139,7 +1149,7 @@ async function main() {
       const [totalSupplyAssets, , totalBorrowAssets] = marketStates[i];
       // bps mode: WETH/USDS (and any market with maxUtilizationBps set) is drained only up
       // to its target utilization (93%), waiting above it; others use the flat
-      // supply-reserve cushion. bands mode: the band decision's hold utilization bounds the
+      // supply-reserve cushion. bands mode: the decision's target utilization bounds the
       // drain instead; an undefined bandUtilBps keeps the flat cushion.
       return {
         marketIndex: a.marketIndex,

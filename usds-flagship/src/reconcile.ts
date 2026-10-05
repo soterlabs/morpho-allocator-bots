@@ -55,7 +55,7 @@ export interface ReconcileMarket {
   priority: boolean;
   /** The PRIMARY market: its priority withdrawal is paid ahead of the other ones. */
   primary: boolean;
-  /** Band behind a non-priority withdrawal (tier key for the floor cut). */
+  /** Target utilization behind a non-priority withdrawal (tier key for the floor cut). */
   bandUtilBps?: number;
   /** Drop threshold for this market's final leg; defaults to the global minActionUsds. */
   minActionUsds?: bigint;
@@ -75,8 +75,9 @@ export interface ReconciledLeg {
 /**
  * Instantaneous supply APY of a pool at the given state (fee 0 on all Flagship
  * markets): borrowApy(util) x util, with the Adaptive Curve IRM multiplier
- * around the 90% target. Computed in APY space — the same linear-in-APY
- * approximation the controller uses for satAPY, plenty for ranking deposits.
+ * around the 90% target. Computed in APY space — a linear-in-APY approximation of
+ * the IRM curve (the controller inverts the exact curve in rate space), plenty for
+ * ranking deposits.
  */
 function spotSupplyApy(anchorApy: number, totalSupplyAssets: bigint, totalBorrowAssets: bigint): number {
   if (totalSupplyAssets <= 0n) return 0;
@@ -196,8 +197,8 @@ function primaryThenLargestFirst(a: ReconcileMarket, b: ReconcileMarket): number
 /**
  * Cut withdrawal wishes to `budget`: priority withdrawals (cap breaches) are served
  * first — the PRIMARY market's ahead of the others, then the largest first — each
- * up to what is left; the band wishes then share the remainder in tiers from the
- * deepest band down. Tiers the budget covers pass whole; the marginal tier is
+ * up to what is left; the steering wishes then share the remainder in tiers from
+ * the highest target utilization down. Tiers the budget covers pass whole; the marginal tier is
  * pooled as one market and every member is withdrawn to the common utilization
  * u* = pooledBorrow / (pooledSupply - remainingBudget); tiers below it are dropped.
  * A cut never exceeds the original wish. Returns the final withdrawal (<= 0) per
@@ -216,7 +217,7 @@ function cutWithdrawals(withdrawals: ReconcileMarket[], budget: bigint): Map<num
   const tiers = new Map<number, ReconcileMarket[]>();
   for (const m of withdrawals.filter(m => !m.priority)) {
     if (m.bandUtilBps === undefined) {
-      throw new Error(`${m.name}: withdrawal wish without a band — cannot tier it for the floor cut`);
+      throw new Error(`${m.name}: withdrawal wish without a target utilization — cannot tier it for the floor cut`);
     }
     const tier = tiers.get(m.bandUtilBps) ?? [];
     tier.push(m);

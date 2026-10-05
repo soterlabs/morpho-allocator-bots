@@ -45,14 +45,14 @@ function observation(overrides: Partial<MarketObservation> = {}): MarketObservat
   };
 }
 
-/** A band-93 drain of 300k from the 4.1M position. */
+/** A heating drain of 300k from the 4.1M position, toward a 93% target utilization. */
 function decision(overrides: Partial<BandDecision> = {}): BandDecision {
   return {
     index: 1,
     targetAmount: parseEther('3800000'),
     bandUtilBps: 9300,
     priority: false,
-    rule: 'R-BAND93',
+    rule: 'R-HEAT',
     reasons: [],
     ...overrides,
   };

@@ -48,29 +48,28 @@ The bot allocates vault funds according to this strategy:
 
 The strategy above is the `bps` mode of a required `ALLOCATION_MODE` env
 (`bps` | `bands`, no default). In **bands** mode the static per-market bps
-targets are replaced by **satAPY band steering**: each STEERED market is held
-at 90 / 91 / 92 / 93 / 94 / 95% utilization depending on where its
-satAPY (= 0.9 x anchor) sits versus thresholds derived from
-SSR_t = SSR + `SSR_T_MARGIN_BPS` (0 by default; SSR read on-chain from
-`sUSDS.ssr()`), letting the Adaptive Curve IRM drift borrow rates toward the
-SSR_t +- 25 bps zone — symmetric around SSR, so a rate slightly under SSR is
-accepted for more competitive borrow rates. Inside the zone the market holds
-with no action.
+targets are replaced by **rate-target steering**: each STEERED market is held
+at the utilization where its **current borrow rate equals SSR + `RATE_MARGIN_BPS`**
+(60 bps by default; SSR read on-chain from `sUSDS.ssr()`, per-market
+override `RATE_MARGIN_<MARKET>_BPS`). The target utilization is the Adaptive
+Curve IRM inverted around the market's anchor (`rateAtTarget`), clamped to
+[`UTIL_MIN_BPS`, `UTIL_MAX_BPS`] = [80%, 95%]. A market whose rate already
+sits within 10 bps of the target rests with no action.
 
-| band | when (satAPY) |
-|---|---|
-| 90% | above the zone (top up from idle as demand grows) |
-| hold | inside the zone [SSR_t - 25 bps, SSR_t + 25 bps] |
-| 91% | [5/6 x SSR_t, zone) |
-| 92% | [2/3 x SSR_t, 5/6 x SSR_t) |
-| 93% | [1/3 x SSR_t, 2/3 x SSR_t) |
-| 94% | [1/12 x SSR_t, 1/3 x SSR_t) |
-| 95% | below 1/12 x SSR_t |
+| regime | target utilization | what it means |
+|---|---|---|
+| `R-HEAT` | 90% and above | the market is cheap: hold it above the IRM's 90% rest point so its anchor drifts up |
+| `R-REST` | — | the borrow rate is within SSR + margin +- 10 bps: no action |
+| `R-COOL` | under 90% | the market is expensive: hold it under 90% so its anchor drifts down |
 
-Per-market gates: 50 bps util deadband, $10k min action, 24 h
-direction-change cooldown (reconstructed from on-chain events), 80%
-monopolist share gate, `MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps
-(REQUIRED in bands mode), SSR sanity bounds [1%, 15%].
+The action is the sign of the delta in every regime (a COOL market whose
+utilization is under its target still gets a withdrawal). Per-market gates:
+50 bps util deadband, $10k min action, 24 h direction-change cooldown
+(reconstructed from on-chain events), 80% monopolist share gate,
+`MAX_ALLOCATE_USDS`/`MAX_DEALLOCATE_USDS` step caps (REQUIRED in bands mode),
+SSR sanity bounds [1%, 15%]. The retired satAPY-ladder envs
+(`SSR_T_MARGIN_BPS`, `SSR_T_TOLERANCE_BPS`, `SSR_T_MARGIN_<MARKET>_BPS`) are
+ignored and only warned about at startup.
 
 **Market caps.** Same semantics as `bps` mode: the bot keeps caps off-chain
 in env and reads the on-chain relative and absolute caps only to clamp
@@ -84,32 +83,36 @@ position with accrued interest, so a fill to the exact cap would revert). The on
 cap never triggers a drain — only the env cap does: a STEERED or PRIMARY position above
 its cap by at least `MIN_PRIORITY_WITHDRAWAL_USDS` ($50k; the 100 USDS dust
 floor when the cap is 0, which drains the market down to it) becomes a
-**priority withdrawal** back to the cap. No band, no deadband, no 24 h
+**priority withdrawal** back to the cap. No rate target, no deadband, no 24 h
 cooldown, no monopolist gate — only the pool's withdrawable liquidity
 (supply − borrow − 5% reserve) and `MAX_DEALLOCATE_USDS` bound it, and it
 replaces the market's steering wish (one wish per market per cycle). RETIRED
 markets are never drained, even above their cap.
 
-**PRIMARY market** (at most one; PT-sUSDS today). No band and no rate input:
-its wish is always "fill to the cap" as a **priority deposit** ($10k min
-action, grow cooldown and `MAX_ALLOCATE_USDS` still apply); at or above the
-cap it holds, and it withdraws only through the priority-withdrawal rule.
+**PRIMARY market** (at most one; PT-sUSDS today). No rate input: its wish is
+"fill to the cap" as a **priority deposit** ($10k min action, grow cooldown
+and `MAX_ALLOCATE_USDS` still apply) — but never past the point where its own
+utilization would drop under `PRIMARY_MIN_UTIL_PERCENT` (80%): the fill target
+is `min(cap, borrow / 0.80)`, so PT grows with its own borrow demand instead
+of absorbing every dollar the steered markets free. The floor is a deposit-time
+guard only — a position above it holds; it withdraws only through the
+priority-withdrawal rule.
 
 The per-market wishes are then reconciled against the vault-level sleeve
 limits (`reconcile.ts`): the sleeve ends every batch inside [15%, 20%] of
 totalAssets. Deposits over the cap: the priority deposit is carved off the
 budget first, the remainder is waterfilled to a common spot rate.
 Withdrawals under the floor: priority withdrawals are served first (the
-PRIMARY market's first, then the largest first), then band tiers from the
-deepest band (the marginal tier lands on one common utilization). Legs below
-their threshold are dropped — $10k for a steering leg or a priority deposit,
-$50k for a priority withdrawal (a zero-cap withdrawal smaller than that
-passes only as a whole).
+PRIMARY market's first, then the largest first), then steering withdrawals
+from the highest target utilization down (the marginal tier lands on one
+common utilization). Legs below their threshold are dropped — $10k for a
+steering leg or a priority deposit, $50k for a priority withdrawal (a
+zero-cap withdrawal smaller than that passes only as a whole).
 
 Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH) | `PRIMARY`
-(PT-sUSDS — filled to its cap first) | `RETIRED` (stUSDS, WETH — never
-touched; keep `ORACLE_WETH` set so any residual WETH position stays visible
-to the completeness check).
+(PT-sUSDS — filled first, to its cap or its utilization floor) | `RETIRED`
+(stUSDS, WETH — never touched; keep `ORACLE_WETH` set so any residual WETH
+position stays visible to the completeness check).
 Cadence `0 * * * *` (hourly);
 `BOT_PAUSED=true` is the kill switch; `bps` mode remains the
 **decision-identical** rollback — allocation decisions are unchanged from the
@@ -201,13 +204,14 @@ DRY_RUN=true npm run dev
 
 ### Cronjob Setup
 
-Run every 6 hours to maintain allocation:
+Run every hour to maintain allocation (the Railway service uses the same
+`0 * * * *` schedule, see `railway.toml`):
 ```bash
 # Edit crontab
 crontab -e
 
 # Add this line (adjust paths as needed)
-0 */6 * * * cd /path/to/morpho-allocator-bots/usds-flagship && /usr/bin/npm run allocate >> /var/log/vault-allocator.log 2>&1
+0 * * * * cd /path/to/morpho-allocator-bots/usds-flagship && /usr/bin/npm run allocate >> /var/log/vault-allocator.log 2>&1
 ```
 
 ## How It Works

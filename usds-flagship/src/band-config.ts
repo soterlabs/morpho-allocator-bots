@@ -1,12 +1,13 @@
 /**
  * Band-steering configuration for the Flagship Vault Allocator Bot.
  *
- * In bands mode (ALLOCATION_MODE=bands) the allocated sleeve is steered by
- * per-market utilization bands chosen from satAPY against thresholds derived
- * from the on-chain Sky Savings Rate (see band-controller.ts). This module
- * owns:
+ * In bands mode (ALLOCATION_MODE=bands) each STEERED market is held at the
+ * utilization where its current borrow rate equals the on-chain Sky Savings Rate
+ * plus a margin (see band-controller.ts). This module owns:
  *
  *   - the BandConfig shape and its env parsing/validation (parseBandConfig),
+ *   - the retired-knob scan (retiredBandEnvWarnings) for env left over from the
+ *     satAPY ladder this steering replaced,
  *   - the SSR RAY -> APY conversion (computeSsrApy),
  *   - the SSR sanity bounds (assertSsrSane) — a bad SSR read must abort the cycle.
  *
@@ -23,18 +24,22 @@
 
 /**
  * How the bot treats a market in bands mode:
- *   STEERED  — steered to a utilization band chosen from satAPY vs SSR_t.
- *   PRIMARY  — no band: always asks for deposits up to its cap, served before any
- *              other deposit (at most one market; see band-controller.ts).
+ *   STEERED  — steered to the utilization where its borrow rate meets SSR + margin.
+ *   PRIMARY  — no rate target: asks for deposits up to its cap, but never past the
+ *              point where its own utilization would drop under
+ *              PRIMARY_MIN_UTIL_PERCENT; served before any other deposit (at most
+ *              one market; see band-controller.ts).
  *   SOUNDING — reserved; configuring it refuses to start (see parseMarketMode).
  *   RETIRED  — the bot never touches the market.
  */
 export type MarketMode = 'STEERED' | 'PRIMARY' | 'SOUNDING' | 'RETIRED';
 
 export interface BandConfig {
-  ssrTMarginBps: number;       // SSR_t = SSR + margin
-  ssrTToleranceBps: number;    // HOLD zone = SSR_t +- tolerance
-  utilDeadbandBps: number;     // no action within +-deadband of the band
+  rateMarginBps: number;       // target borrow rate = SSR + margin (per-market override in MarketConfig)
+  utilMinBps: number;          // the target utilization is clamped into [utilMinBps, utilMaxBps]
+  utilMaxBps: number;
+  primaryMinUtilPercent: number; // a PRIMARY fill never pushes that market's utilization under this
+  utilDeadbandBps: number;     // no action within +-deadband of the target utilization
   minBandActionUsds: bigint;   // smaller steering legs and priority deposits are dropped
   minPriorityWithdrawalUsds: bigint; // smaller priority withdrawals (cap breaches) wait
   sleeveFloorBps: number;      // hard floor on the allocated sleeve, bps of totalAssets
@@ -47,6 +52,19 @@ export interface BandConfig {
 }
 
 const USDS_WAD = 10n ** 18n; // USDS has 18 decimals
+
+/**
+ * Env vars of the retired satAPY ladder (SSR_t margin / tolerance zone). They are
+ * ignored: the rate target replaced the zone outright and the margin changed meaning
+ * (it now sits on the borrow rate, not on a 0.9 x anchor proxy), so an old value
+ * must never be reinterpreted as a new one. Left in place on a deployment they only
+ * earn a startup warning — a bands-mode cutover ships with zero env changes.
+ */
+export const RETIRED_BAND_ENV_VARS: readonly string[] = [
+  'SSR_T_MARGIN_BPS', 'SSR_T_TOLERANCE_BPS',
+  'SSR_T_MARGIN_STUSDS_BPS', 'SSR_T_MARGIN_CBBTC_BPS', 'SSR_T_MARGIN_WSTETH_BPS',
+  'SSR_T_MARGIN_PTSUSDS_BPS', 'SSR_T_MARGIN_WETH_BPS',
+];
 const RAY = 1e27;            // sUSDS.ssr() precision
 const SECONDS_PER_YEAR = 31_536_000; // 365 days — matches the ssr() compounding convention
 
@@ -119,15 +137,31 @@ function parseRequiredPositiveUsds(raw: string | undefined, label: string): bigi
 }
 
 /**
+ * Parse a whole-number percent env in [1, 100]. Returns the default ONLY when unset;
+ * 0 is rejected (it would divide by zero in the utilization floor it configures).
+ */
+function parsePercent(raw: string | undefined, defaultValue: number, label: string): number {
+  const value = parseWholeNumber(raw, defaultValue, label);
+  if (value < 1 || value > 100) {
+    throw new Error(`${label} must be a whole number of percent in [1, 100], got "${raw}"`);
+  }
+  return value;
+}
+
+/**
  * Parse and validate the full band-steering configuration from an env record.
  *
  * Env vars and defaults:
- *   SSR_T_MARGIN_BPS            — SSR_t = SSR + margin (0)
- *   SSR_T_TOLERANCE_BPS         — HOLD zone half-width around SSR_t (25): the zone is
- *                                 symmetric, [SSR - 25, SSR + 25] bps at the defaults —
- *                                 a rate slightly under SSR is accepted in exchange for
- *                                 more competitive borrow rates
- *   UTIL_DEADBAND_BPS           — no action within +-deadband of the band (50)
+ *   RATE_MARGIN_BPS             — target borrow rate = SSR + margin (60); a per-market
+ *                                 RATE_MARGIN_<MARKET>_BPS override is parsed with the
+ *                                 market table (market-config.ts)
+ *   UTIL_MIN_BPS / UTIL_MAX_BPS — the target utilization is clamped into this range
+ *                                 (8000 / 9500): below 80% a market is pure dilution,
+ *                                 above 95% its idle liquidity is too thin to drain
+ *   PRIMARY_MIN_UTIL_PERCENT    — a PRIMARY fill stops where that market's utilization
+ *                                 would drop under this (80), so it tracks its own
+ *                                 borrow demand instead of absorbing every freed dollar
+ *   UTIL_DEADBAND_BPS           — no action within +-deadband of the target utilization (50)
  *   MIN_BAND_ACTION_USDS        — smaller steering legs / priority deposits are dropped, whole USDS (10000)
  *   MIN_PRIORITY_WITHDRAWAL_USDS — smaller priority withdrawals (cap breaches) wait, whole USDS (50000)
  *   SLEEVE_FLOOR_BPS            — hard sleeve floor as bps of totalAssets (1500)
@@ -137,6 +171,8 @@ function parseRequiredPositiveUsds(raw: string | undefined, label: string): bigi
  *   MAX_ALLOCATE_USDS / MAX_DEALLOCATE_USDS — REQUIRED per-cycle step caps, whole USDS
  *
  * Throws on any invalid or missing-required value. Cross-field validation:
+ *   - 0 < UTIL_MIN_BPS < UTIL_MAX_BPS (a zero floor would divide by zero in the
+ *     target inversion; an inverted range has no target at all)
  *   - step caps >= MIN_BAND_ACTION_USDS, MAX_DEALLOCATE_USDS >= MIN_PRIORITY_WITHDRAWAL_USDS
  *     (a step cap under a drop threshold would clamp every wish into the drop)
  *   - sleeve floor < 2000 bps (the sleeve cap is 20%; a floor at/above it is nonsensical)
@@ -144,8 +180,10 @@ function parseRequiredPositiveUsds(raw: string | undefined, label: string): bigi
  */
 export function parseBandConfig(env: Record<string, string | undefined>): BandConfig {
   const cfg: BandConfig = {
-    ssrTMarginBps: parseBps(env.SSR_T_MARGIN_BPS, 0, 'SSR_T_MARGIN_BPS'),
-    ssrTToleranceBps: parseBps(env.SSR_T_TOLERANCE_BPS, 25, 'SSR_T_TOLERANCE_BPS'),
+    rateMarginBps: parseBps(env.RATE_MARGIN_BPS, 60, 'RATE_MARGIN_BPS'),
+    utilMinBps: parseBps(env.UTIL_MIN_BPS, 8000, 'UTIL_MIN_BPS'),
+    utilMaxBps: parseBps(env.UTIL_MAX_BPS, 9500, 'UTIL_MAX_BPS'),
+    primaryMinUtilPercent: parsePercent(env.PRIMARY_MIN_UTIL_PERCENT, 80, 'PRIMARY_MIN_UTIL_PERCENT'),
     utilDeadbandBps: parseBps(env.UTIL_DEADBAND_BPS, 50, 'UTIL_DEADBAND_BPS'),
     minBandActionUsds: parseWholeUsds(env.MIN_BAND_ACTION_USDS, 10_000n, 'MIN_BAND_ACTION_USDS'),
     minPriorityWithdrawalUsds: parseWholeUsds(env.MIN_PRIORITY_WITHDRAWAL_USDS, 50_000n, 'MIN_PRIORITY_WITHDRAWAL_USDS'),
@@ -158,6 +196,12 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
     maxDeallocateUsds: parseRequiredPositiveUsds(env.MAX_DEALLOCATE_USDS, 'MAX_DEALLOCATE_USDS'),
   };
 
+  if (cfg.utilMinBps < 1 || cfg.utilMinBps >= cfg.utilMaxBps) {
+    throw new Error(
+      `utilization clamp must satisfy 0 < UTIL_MIN_BPS < UTIL_MAX_BPS, got ` +
+      `UTIL_MIN_BPS ${cfg.utilMinBps}, UTIL_MAX_BPS ${cfg.utilMaxBps}`
+    );
+  }
   if (cfg.sleeveFloorBps >= 2000) {
     throw new Error(
       `SLEEVE_FLOOR_BPS must be < 2000 (the floor lives inside the 20% sleeve), got ${cfg.sleeveFloorBps}`
@@ -187,6 +231,17 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
 }
 
 /**
+ * One warning line per retired band env var that is still set, for the executor to
+ * log at startup. Pure: the caller decides how to surface them. The values are not
+ * parsed at all — a retired knob is ignored whatever it holds.
+ */
+export function retiredBandEnvWarnings(env: Record<string, string | undefined>): string[] {
+  return RETIRED_BAND_ENV_VARS
+    .filter(name => env[name] !== undefined)
+    .map(name => `${name} is set but retired — ignored (rate-target steering uses RATE_MARGIN_BPS / RATE_MARGIN_<MARKET>_BPS)`);
+}
+
+/**
  * Convert sUSDS.ssr() (per-second growth factor in RAY, 1e27) to an APY fraction:
  *
  *   APY = (ssr / 1e27) ^ 31_536_000 - 1     (e.g. 0.0352 for 3.52%)
@@ -208,9 +263,9 @@ export function computeSsrApy(ssrRay: bigint): number {
  * Abort the cycle if the SSR APY reads outside the configured sanity bounds
  * [ssrMinApyBps, ssrMaxApyBps] (defaults [100, 1500] bps = [1%, 15%], inclusive).
  *
- * The whole band ladder is proportional to SSR, so a corrupted read (proxy upgrade,
- * ABI drift, RPC garbage) would silently re-derive every threshold — better to throw
- * and skip the cycle than steer the sleeve off a bogus anchor. NaN/Infinity also throw.
+ * Every rate target is SSR + margin, so a corrupted read (proxy upgrade, ABI drift,
+ * RPC garbage) would silently re-aim every market — better to throw and skip the
+ * cycle than steer the sleeve off a bogus anchor. NaN/Infinity also throw.
  */
 export function assertSsrSane(ssrApy: number, cfg: BandConfig): void {
   const min = cfg.ssrMinApyBps / 10000;
