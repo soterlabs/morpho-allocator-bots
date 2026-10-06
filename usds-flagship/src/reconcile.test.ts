@@ -512,11 +512,11 @@ describe('priority withdrawals (cap breaches) under the 15% floor', () => {
     expect(legs[2].note).toMatch(/sleeve floor/);
   });
 
-  it('still refuses a non-priority withdrawal that carries no band', () => {
+  it('still refuses a non-priority withdrawal that carries no target utilization', () => {
     // An ordinary drain with no tier key cannot be placed in the floor cut.
     expect(() => reconcile([
       wish({ index: 0, delta: -parseEther('400000'), bandUtilBps: undefined }),
-    ], parseEther('5300000'))).toThrow(/withdrawal wish without a band/);
+    ], parseEther('5300000'))).toThrow(/withdrawal wish without a target utilization/);
   });
 
   it('accepts a priority withdrawal without a band', () => {

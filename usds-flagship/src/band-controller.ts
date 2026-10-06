@@ -13,18 +13,26 @@
  *      floor when the cap is 0) is drained back to the cap — no band, no deadband, no
  *      cooldown, no share gate; only the pool's withdrawable liquidity and
  *      MAX_DEALLOCATE bound it. It replaces whatever steering would have wished.
- *   1. Priority deposit (PRIMARY): no band — the wish is always "fill to
- *      effectiveCap", served by reconciliation before any other deposit. A PRIMARY
+ *   1. Priority deposit (PRIMARY): no rate target — the wish is "fill to
+ *      effectiveCap", capped where the market's own utilization would drop under
+ *      primaryMinUtilPercent (a deposit-only guard: a position already above that
+ *      point holds), served by reconciliation before any other deposit. A PRIMARY
  *      market withdraws only through rule 0.
- *   2. Steering (STEERED): satAPY = 0.9 x anchorAPY picks the utilization band from
- *      thresholds derived from SSR_t = SSR + margin (see pickBand); inside the
- *      SSR_t +- tolerance zone the market HOLDs. The band is inverted into an absolute
- *      vault target (targetSupply = ceil(borrow / band)).
+ *   2. Steering (STEERED): the market is held at the utilization u* where its
+ *      CURRENT borrow rate equals the target rate SSR + margin — the number borrowers
+ *      react to — found by inverting the Adaptive Curve IRM around the anchor
+ *      (irm-curve.ts). [utilMinBps, utilMaxBps] bounds how far the bot itself pushes
+ *      the market (a heating drain stops at utilMaxBps, a cooling deposit at
+ *      utilMinBps); it is never a reason to push the other way, so a market that
+ *      borrowers moved past a bound holds until the rate asks for a move back in.
+ *      u* is inverted into an absolute vault target (targetSupply = ceil(borrow / u*)).
+ *      A market whose rate already sits within RATE_REST_HALF_WIDTH_BPS of the target
+ *      RESTs.
  *
  * Rules 1 and 2 size their wish through the same three steps, called in order:
  * boundTarget (the deposit ceiling), sizeGate (min action, direction cooldown),
- * clampToStepCaps. Steering adds the utilization deadband before and the monopolist
- * share after the shared gate.
+ * clampToStepCaps. Steering adds the rate rest check, the clamp gate and the
+ * utilization deadband before and the monopolist share after the shared gate.
  *
  * RETIRED markets are never touched — not even above their cap. SOUNDING is rejected
  * at startup (market-config.ts parseMarketMode) and defensively rejected here too.
@@ -37,15 +45,25 @@
 
 import type { BandConfig, MarketMode } from './band-config.js';
 import { DUST_FLOOR_USDS, maxWithdrawableWithReserve } from './allocation-logic.js';
+import { borrowApyAtUtilization, utilizationBpsForBorrowApy } from './irm-curve.js';
 
 const USDS_WAD = 10n ** 18n;
 const SEC_PER_HOUR = 3_600;
 
 /**
- * satAPY = SAT_APY_FACTOR x anchorAPY: at the IRM's 90% target utilization suppliers
- * earn the borrow rate on 90% of their capital (fee is 0 on all Flagship markets).
+ * A steered market whose current borrow rate is within this many bps of its target
+ * rests: the aim band is SSR + margin +- 10 bps (SSR + 50-70 bps at the default
+ * margin). With a $10k minimum action moving a $3M market's rate by ~30 bps, finer
+ * aim is not available anyway.
  */
-const SAT_APY_FACTOR = 0.9;
+const RATE_REST_HALF_WIDTH_BPS = 10;
+
+/**
+ * The IRM's target utilization: the only utilization at which the anchor stands
+ * still. A target above it heats the market (the anchor drifts up while held there),
+ * a target below it cools it.
+ */
+const IRM_TARGET_UTIL_BPS = 9000;
 
 /**
  * Anchor reads above this are garbage: the Adaptive Curve IRM caps rateAtTarget at
@@ -56,8 +74,8 @@ const MAX_SANE_ANCHOR_APY = 10;
 
 export interface MarketObservation {
   index: number; name: string; mode: MarketMode;
-  // Per-market SSR_t margin override (bps). Falls back to cfg.ssrTMarginBps when unset.
-  ssrTMarginBps?: number;
+  // Per-market rate-margin override (bps). Falls back to cfg.rateMarginBps when unset.
+  rateMarginBps?: number;
   totalSupplyAssets: bigint; totalBorrowAssets: bigint;  // accrued market totals
   vaultAssets: bigint;                                    // adapter position in this market
   anchorApy: number;                                      // rateAtTarget as APY, 0.0352 = 3.52%
@@ -70,16 +88,30 @@ export interface MarketObservation {
   lastAllocateAtSec?: number; lastDeallocateAtSec?: number; // undefined = none in lookback window
 }
 
+/**
+ * Where a steered market's target utilization sits relative to the IRM's 90% rest
+ * point: HEAT (u* >= 90%: holding it there drifts the anchor up), COOL (u* < 90%:
+ * the anchor drifts down), REST (the borrow rate is already on target, or the
+ * utilization is inside the deadband of u*). A trace label: the action is the sign
+ * of the delta, in every regime.
+ */
+export type Regime = 'HEAT' | 'REST' | 'COOL';
+
 /** Machine-readable trace key for the decision a market ended on. */
 export type BandRule =
-  | 'R-BAND90' | 'R-BAND91' | 'R-BAND92' | 'R-BAND93' | 'R-BAND94' | 'R-BAND95'
-  | 'R-HOLD' | 'R-DEADBAND' | 'R-MINACTION' | 'R-COOLDOWN' | 'R-SHARE' | 'R-RETIRED'
+  | 'R-HEAT' | 'R-REST' | 'R-COOL'
+  | 'R-HOLD' | 'R-CLAMP' | 'R-DEADBAND' | 'R-MINACTION' | 'R-COOLDOWN' | 'R-SHARE' | 'R-RETIRED'
   | 'R-PRIORITY-DEPOSIT' | 'R-PRIORITY-WITHDRAWAL';
 
 export interface BandDecision {
   index: number;
   targetAmount: bigint;      // absolute vault target for this market this cycle
-  bandUtilBps?: number;      // util the market is held to; undefined when there is no band (holds, priority wishes)
+  // Target utilization u* (bps) a steered market is held to; it doubles as the
+  // market's maxUtilizationBps for the executor's withdrawal clamp. Undefined when
+  // there is no rate target (PRIMARY, RETIRED, priority wishes).
+  bandUtilBps?: number;
+  targetRateApy?: number;    // SSR + margin the steered market is aimed at, 0.0412 = 4.12%
+  regime?: Regime;           // steered markets only
   // Served before the ordinary wishes in reconciliation: a priority deposit (PRIMARY
   // fill) or a priority withdrawal (cap breach). Always false on a hold.
   priority: boolean;
@@ -124,38 +156,73 @@ function fmtUtc(sec: number): string {
 }
 
 /** A no-action decision: the market keeps its position. */
-function holdAt(m: MarketObservation, rule: BandRule, bandUtilBps: number | undefined, reasons: string[]): BandDecision {
-  return { index: m.index, targetAmount: m.vaultAssets, bandUtilBps, priority: false, rule, reasons };
+function holdAt(m: MarketObservation, rule: BandRule, reasons: string[], steering?: SteeringTarget): BandDecision {
+  return {
+    index: m.index, targetAmount: m.vaultAssets, priority: false, rule, reasons,
+    bandUtilBps: steering?.utilBps, targetRateApy: steering?.rateApy, regime: steering?.regime,
+  };
 }
 
-type BandUtil = 9000 | 9100 | 9200 | 9300 | 9400 | 9500;
+/** The resolved rate target of a steered market, carried on every decision it makes. */
+interface SteeringTarget {
+  rateApy: number;   // SSR + margin
+  utilBps: number;   // u*: the clamped utilization that prices the market at rateApy
+  regime: Regime;
+}
 
-const BAND_RULE: Record<BandUtil, BandRule> = {
-  9000: 'R-BAND90', 9100: 'R-BAND91', 9200: 'R-BAND92',
-  9300: 'R-BAND93', 9400: 'R-BAND94', 9500: 'R-BAND95',
-};
+/** Market utilization as a WAD fraction (1e18 = 100%); an empty market reads as 0. */
+function utilizationWad(totalSupplyAssets: bigint, totalBorrowAssets: bigint): bigint {
+  if (totalSupplyAssets <= 0n) return 0n;
+  return (totalBorrowAssets * USDS_WAD) / totalSupplyAssets;
+}
 
 /**
- * Utilization band (bps) for a market given its satAPY, or 'HOLD' inside the
- * satisfaction zone. Every threshold derives from SSR_t, so a governance SSR change
- * moves the whole ladder automatically:
- *
- *   satAPY >  SSR_t + tolerance   -> 9000  (rate rich — top up from idle as demand grows)
- *   satAPY >= SSR_t - tolerance   -> HOLD  (zone [SSR - 25, SSR + 25] bps at defaults)
- *   satAPY >= 5/6  x SSR_t        -> 9100  (gentlest heating — a market just under the zone)
- *   satAPY >= 2/3  x SSR_t        -> 9200
- *   satAPY >= 1/3  x SSR_t        -> 9300
- *   satAPY >= 1/12 x SSR_t        -> 9400
- *   otherwise                     -> 9500  (deepest heating)
+ * Target utilization u* for a steered market whose curve inverse (the utilization at
+ * which the IRM prices it at the target rate) is `curveUtilBps`, bounded in the
+ * direction the rate asks for: a heating drain (curve inverse above the current
+ * utilization) stops at utilMaxBps, a cooling deposit at utilMinBps. The bound limits
+ * how far the bot itself pushes the market — it is not a range the bot patrols, so a
+ * move back toward the range lands on the exact curve inverse even when that is
+ * outside it, and a market already past the bound in the asked-for direction is held
+ * by clampGate. The bound is recorded in reasons; an unreachable target (above
+ * 4 x anchor, below anchor / 4) saturates at the curve's end and so lands on it too.
  */
-function pickBand(satApy: number, ssrTApy: number, toleranceApy: number): BandUtil | 'HOLD' {
-  if (satApy > ssrTApy + toleranceApy) return 9000;
-  if (satApy >= ssrTApy - toleranceApy) return 'HOLD';
-  if (satApy >= (5 / 6) * ssrTApy) return 9100;
-  if (satApy >= (2 / 3) * ssrTApy) return 9200;
-  if (satApy >= (1 / 3) * ssrTApy) return 9300;
-  if (satApy >= (1 / 12) * ssrTApy) return 9400;
-  return 9500;
+function targetUtilization(utilBps: number, curveUtilBps: number, cfg: BandConfig, reasons: string[]): number {
+  if (curveUtilBps > utilBps && curveUtilBps > cfg.utilMaxBps) {
+    reasons.push(`curve inverse ${curveUtilBps} bps clamped down to UTIL_MAX ${cfg.utilMaxBps} bps`);
+    return cfg.utilMaxBps;
+  }
+  if (curveUtilBps < utilBps && curveUtilBps < cfg.utilMinBps) {
+    reasons.push(`curve inverse ${curveUtilBps} bps clamped up to UTIL_MIN ${cfg.utilMinBps} bps`);
+    return cfg.utilMinBps;
+  }
+  return curveUtilBps;
+}
+
+/**
+ * Steering gate: the bound blocks the only useful direction -> R-CLAMP. A market at or
+ * past UTIL_MAX whose rate is under the target would need an even hotter utilization;
+ * one at or past UTIL_MIN whose rate is over it would need a colder one. Pushing it
+ * back into the range would move the rate AWAY from the target (and spend sleeve
+ * budget doing so), so the bot holds and leaves the move to the anchor drift, which
+ * works in the right direction on both sides of 90% — the faster the further out.
+ */
+function clampGate(utilBps: number, curveUtilBps: number, targetUtilBps: number, cfg: BandConfig): Hold | undefined {
+  if (curveUtilBps > utilBps && targetUtilBps <= utilBps) {
+    return {
+      rule: 'R-CLAMP',
+      why: `util ${utilBps} bps already at/above UTIL_MAX ${cfg.utilMaxBps} bps and the rate wants it higher ` +
+        `(curve inverse ${curveUtilBps} bps) -> hold, the anchor heats on its own above 90%`,
+    };
+  }
+  if (curveUtilBps < utilBps && targetUtilBps >= utilBps) {
+    return {
+      rule: 'R-CLAMP',
+      why: `util ${utilBps} bps already at/below UTIL_MIN ${cfg.utilMinBps} bps and the rate wants it lower ` +
+        `(curve inverse ${curveUtilBps} bps) -> hold, the anchor cools on its own below 90%`,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -220,10 +287,13 @@ function clampToStepCaps(cfg: BandConfig, delta: bigint, reasons: string[]): big
   return delta;
 }
 
-/** Steering gate: |utilBps - band| <= deadband (inclusive) -> R-DEADBAND. */
-function deadbandGate(utilBps: number, band: BandUtil, cfg: BandConfig): Hold | undefined {
-  if (Math.abs(utilBps - band) > cfg.utilDeadbandBps) return undefined;
-  return { rule: 'R-DEADBAND', why: `|util ${utilBps} - band ${band}| <= deadband ${cfg.utilDeadbandBps} bps -> hold` };
+/** Steering gate: |utilBps - u*| <= deadband (inclusive) -> R-DEADBAND. */
+function deadbandGate(utilBps: number, targetUtilBps: number, cfg: BandConfig): Hold | undefined {
+  if (Math.abs(utilBps - targetUtilBps) > cfg.utilDeadbandBps) return undefined;
+  return {
+    rule: 'R-DEADBAND',
+    why: `|util ${utilBps} - target util ${targetUtilBps}| <= deadband ${cfg.utilDeadbandBps} bps -> hold`,
+  };
 }
 
 /**
@@ -285,7 +355,7 @@ function decidePriorityWithdrawal(
     reasons.push(`drain clamped to withdrawable liquidity ${fmtUsds(withdrawable)} (${liquidityReservePercent}% reserve)`);
   }
   if (drain < threshold) {
-    return holdAt(m, 'R-PRIORITY-WITHDRAWAL', undefined, [...reasons,
+    return holdAt(m, 'R-PRIORITY-WITHDRAWAL', [...reasons,
       `withdrawable slice ${fmtUsds(drain)} < ${fmtUsds(threshold)} -> hold, retry next cycle`]);
   }
   const delta = clampToStepCaps(cfg, -drain, reasons);
@@ -297,23 +367,33 @@ function decidePriorityWithdrawal(
 
 /**
  * Priority deposit (PRIMARY): the market is the vault's bootstrap destination, so it
- * always asks for the whole gap up to its deposit ceiling. No band and no rate input:
- * satAPY plays no role. At or above the ceiling the market holds (draining back to
- * the cap is the priority-withdrawal rule's job); otherwise the gap is sized by the
- * shared steps.
+ * asks for the whole gap up to its fill target, with no rate input — the anchor plays
+ * no role. The fill target is the smaller of the deposit ceiling and the utilization
+ * floor: the vault position at which the market's utilization would be exactly
+ * primaryMinUtilPercent (supply = borrow / floor, floored so the fill never lands
+ * under it). The floor makes the fill track the market's own borrow demand instead of
+ * absorbing every dollar other markets free. It is a deposit-time guard only: at or
+ * above the fill target the market holds (draining back to the cap is the
+ * priority-withdrawal rule's job); otherwise the gap is sized by the shared steps.
  */
 function decidePriorityDeposit(m: MarketObservation, cfg: BandConfig, nowSec: number): BandDecision {
   const reasons: string[] = [];
-  const delta = boundTarget(m, m.effectiveCap, reasons) - m.vaultAssets;
+  const floorSupplyTotal = (m.totalBorrowAssets * 100n) / BigInt(cfg.primaryMinUtilPercent);
+  const vaultAtFloor = m.vaultAssets + floorSupplyTotal - m.totalSupplyAssets;
+  const floorBinds = vaultAtFloor < m.effectiveCap;
+  const fillTarget = boundTarget(m, floorBinds ? vaultAtFloor : m.effectiveCap, reasons);
+  const delta = fillTarget - m.vaultAssets;
   reasons.unshift(
-    `mode=PRIMARY: fill to effectiveCap ${fmtUsds(m.effectiveCap)} from ${fmtUsds(m.vaultAssets)} ` +
-    `(delta ${fmtSignedUsds(delta)})`
+    `mode=PRIMARY: fill to min(effectiveCap ${fmtUsds(m.effectiveCap)}, ` +
+    `util floor ${fmtUsds(vaultAtFloor < 0n ? 0n : vaultAtFloor)} = position at ${cfg.primaryMinUtilPercent}% util ` +
+    `on borrow ${fmtUsds(m.totalBorrowAssets)}) from ${fmtUsds(m.vaultAssets)} (delta ${fmtSignedUsds(delta)})`
   );
   if (delta <= 0n) {
-    return holdAt(m, 'R-HOLD', undefined, [...reasons, 'at/above effectiveCap -> hold']);
+    return holdAt(m, 'R-HOLD', [...reasons,
+      `at/above ${floorBinds ? `the ${cfg.primaryMinUtilPercent}% util floor` : 'effectiveCap'} -> hold`]);
   }
   const gate = sizeGate(m, cfg, nowSec, delta);
-  if (gate) return holdAt(m, gate.rule, undefined, [...reasons, gate.why]);
+  if (gate) return holdAt(m, gate.rule, [...reasons, gate.why]);
   const step = clampToStepCaps(cfg, delta, reasons);
   return {
     index: m.index, targetAmount: m.vaultAssets + step, bandUtilBps: undefined,
@@ -322,55 +402,67 @@ function decidePriorityDeposit(m: MarketObservation, cfg: BandConfig, nowSec: nu
 }
 
 /**
- * Steering (STEERED): pick the band from satAPY (HOLD inside the zone), invert it
- * into an absolute vault target and size the wish through the shared steps, with
- * the two steering-only gates around the shared one (each hold carries its own
- * rule): deadband -> min action -> cooldown -> share -> step caps.
+ * Steering (STEERED): aim the market's borrow rate at SSR + margin. The target
+ * utilization u* is the curve inverse of that rate around the anchor, bounded in the
+ * asked-for direction (targetUtilization); a market whose current rate is already
+ * within RATE_REST_HALF_WIDTH_BPS of the target RESTs with no action. Otherwise u*
+ * is inverted into an absolute vault target and the wish is sized through the shared
+ * steps, with the three steering-only gates around the shared one (each hold carries
+ * its own rule): rest -> clamp -> deadband -> min action -> cooldown -> share -> step caps.
  */
 function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, nowSec: number): BandDecision {
-  if (!Number.isFinite(m.anchorApy) || m.anchorApy < 0 || m.anchorApy > MAX_SANE_ANCHOR_APY) {
-    // The whole ladder keys off satAPY = 0.9 x anchor, so a corrupted rateAtTarget
-    // read would steer real funds off garbage. Abort the cycle instead.
+  if (!Number.isFinite(m.anchorApy) || m.anchorApy <= 0 || m.anchorApy > MAX_SANE_ANCHOR_APY) {
+    // The whole target keys off the anchor, so a corrupted rateAtTarget read would
+    // steer real funds off garbage. Zero is included: the IRM floors rateAtTarget at
+    // 0.1% APR on-chain, so 0 can only be a failed read. Abort the cycle instead.
     throw new Error(
-      `${m.name}: anchor APY ${m.anchorApy} is outside [0, ${MAX_SANE_ANCHOR_APY}] — ` +
+      `${m.name}: anchor APY ${m.anchorApy} is outside (0, ${MAX_SANE_ANCHOR_APY}] — ` +
       `refusing to steer off a suspect read`
     );
   }
-  const marginBps = m.ssrTMarginBps ?? cfg.ssrTMarginBps;
-  const ssrT = ssrApy + marginBps / 10000;
-  const toleranceApy = cfg.ssrTToleranceBps / 10000;
-  const satApy = SAT_APY_FACTOR * m.anchorApy;
-  const ssrTDesc =
-    `SSR ${fmtPct(ssrApy)} + ${marginBps} bps${m.ssrTMarginBps !== undefined ? ' (per-market override)' : ''}`;
-
-  const band = pickBand(satApy, ssrT, toleranceApy);
-  if (band === 'HOLD') {
-    return holdAt(m, 'R-HOLD', undefined, [
-      `satApy ${fmtPct(satApy)} (0.9 x anchor ${fmtPct(m.anchorApy)}) inside zone ` +
-      `[${fmtPct(ssrT - toleranceApy)}, ${fmtPct(ssrT + toleranceApy)}] ` +
-      `(SSR_t ${fmtPct(ssrT)} = ${ssrTDesc}) -> hold`,
-    ]);
-  }
-
-  const reasons: string[] = [
-    `satApy ${fmtPct(satApy)} (0.9 x anchor ${fmtPct(m.anchorApy)}) vs SSR_t ${fmtPct(ssrT)} ` +
-    `+- ${fmtPct(toleranceApy)} (${ssrTDesc}) -> band ${band} bps`,
-  ];
-
-  // Invert the band into an absolute vault target; ceil keeps the resulting
-  // utilization from rounding ABOVE the band.
-  const targetSupplyTotal = ceilDiv(m.totalBorrowAssets * 10000n, BigInt(band));
-  const targetVault = boundTarget(m, m.vaultAssets + targetSupplyTotal - m.totalSupplyAssets, reasons);
-  const delta = targetVault - m.vaultAssets;
+  const marginBps = m.rateMarginBps ?? cfg.rateMarginBps;
+  const rateApy = ssrApy + marginBps / 10000;
+  const reasons: string[] = [];
   const utilBps = utilizationBps(m.totalSupplyAssets, m.totalBorrowAssets);
-  reasons.push(
-    `util ${utilBps} bps, band ${band} bps -> vault target ${fmtUsds(targetVault)} (delta ${fmtSignedUsds(delta)})`
+  const borrowApyNow = borrowApyAtUtilization(m.anchorApy, utilizationWad(m.totalSupplyAssets, m.totalBorrowAssets));
+  const deviationBps = Math.round((borrowApyNow - rateApy) * 10000);
+  const curveUtilBps = utilizationBpsForBorrowApy(rateApy, m.anchorApy);
+  const targetUtilBps = targetUtilization(utilBps, curveUtilBps, cfg, reasons);
+  reasons.unshift(
+    `target rate ${fmtPct(rateApy)} = SSR ${fmtPct(ssrApy)} + ${marginBps} bps` +
+    `${m.rateMarginBps !== undefined ? ' (per-market override)' : ''}; ` +
+    `anchor ${fmtPct(m.anchorApy)}, util ${utilBps} bps -> borrow ${fmtPct(borrowApyNow)} ` +
+    `(${deviationBps >= 0 ? '+' : ''}${deviationBps} bps off target)`
   );
 
-  const gate = deadbandGate(utilBps, band, cfg) ?? sizeGate(m, cfg, nowSec, delta) ?? shareGate(m, cfg, delta);
-  if (gate) return holdAt(m, gate.rule, band, [...reasons, gate.why]);
+  if (Math.abs(deviationBps) <= RATE_REST_HALF_WIDTH_BPS) {
+    return holdAt(m, 'R-REST', [...reasons,
+      `borrow rate within +-${RATE_REST_HALF_WIDTH_BPS} bps of target -> rest`],
+      { rateApy, utilBps: targetUtilBps, regime: 'REST' });
+  }
+  const regime: Regime = targetUtilBps >= IRM_TARGET_UTIL_BPS ? 'HEAT' : 'COOL';
+  const steering: SteeringTarget = { rateApy, utilBps: targetUtilBps, regime };
+  const clamp = clampGate(utilBps, curveUtilBps, targetUtilBps, cfg);
+  if (clamp) return holdAt(m, clamp.rule, [...reasons, clamp.why], steering);
+
+  // Invert u* into an absolute vault target; ceil keeps the resulting utilization
+  // from rounding ABOVE the target.
+  const targetSupplyTotal = ceilDiv(m.totalBorrowAssets * 10000n, BigInt(targetUtilBps));
+  const targetVault = boundTarget(m, m.vaultAssets + targetSupplyTotal - m.totalSupplyAssets, reasons);
+  const delta = targetVault - m.vaultAssets;
+  reasons.push(
+    `target util ${targetUtilBps} bps (${regime}) -> vault target ${fmtUsds(targetVault)} (delta ${fmtSignedUsds(delta)})`
+  );
+
+  const deadband = deadbandGate(utilBps, targetUtilBps, cfg);
+  if (deadband) return holdAt(m, deadband.rule, [...reasons, deadband.why], { ...steering, regime: 'REST' });
+  const gate = sizeGate(m, cfg, nowSec, delta) ?? shareGate(m, cfg, delta);
+  if (gate) return holdAt(m, gate.rule, [...reasons, gate.why], steering);
   const step = clampToStepCaps(cfg, delta, reasons);
-  return { index: m.index, targetAmount: m.vaultAssets + step, bandUtilBps: band, priority: false, rule: BAND_RULE[band], reasons };
+  return {
+    index: m.index, targetAmount: m.vaultAssets + step, priority: false, rule: `R-${regime}`, reasons,
+    bandUtilBps: targetUtilBps, targetRateApy: rateApy, regime,
+  };
 }
 
 /** Single-market decision by mode, with the priority-withdrawal rule ahead of any steering. */
@@ -378,7 +470,7 @@ function decideMarket(
   m: MarketObservation, cfg: BandConfig, ssrApy: number, nowSec: number, liquidityReservePercent: bigint,
 ): BandDecision {
   if (m.mode === 'RETIRED') {
-    return holdAt(m, 'R-RETIRED', undefined,
+    return holdAt(m, 'R-RETIRED',
       [`mode=RETIRED — the bot never touches this market (position ${fmtUsds(m.vaultAssets)})`]);
   }
   if (m.mode === 'SOUNDING') {

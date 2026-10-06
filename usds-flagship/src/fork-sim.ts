@@ -20,8 +20,8 @@
  *   - No Safe signature machinery (that path is covered by the production executor and
  *     is not what this harness tests).
  *
- * Everything else — snapshot pinning, accrual via blue-sdk, SSR sanity, band choice,
- * reconciliation, the batch guard — is the same code the bot runs.
+ * Everything else — snapshot pinning, accrual via blue-sdk, SSR sanity, the rate
+ * target, reconciliation, the batch guard — is the same code the bot runs.
  */
 
 import 'dotenv/config';
@@ -31,11 +31,12 @@ import {
   USDS, IRM_ADAPTIVE, MORPHO_BLUE, SUSDS, markets, morphoBlueAbi, susdsAbi,
   encodeMarketParams, computeMarketId, computeCollateralCapId, computeAdapterCapId, validateBandsMarkets,
 } from './market-config.js';
-import { parseBandConfig, computeSsrApy, assertSsrSane } from './band-config.js';
+import { parseBandConfig, retiredBandEnvWarnings, computeSsrApy, assertSsrSane } from './band-config.js';
 import { computeBandDecisions, type BandDecision, type MarketObservation } from './band-controller.js';
 import { reconcileToVaultLimits, type ReconcileMarket } from './reconcile.js';
 import { assertBandBatchSafe, type PlannedBatchCall } from './batch-guards.js';
 import { anchorPerSecWadToApy } from './anchor-sim.js';
+import { borrowApyAtUtilization } from './irm-curve.js';
 import {
   capDeallocationsToLiquidity, computeCapLimit, computeAllocationBudget, capAllocationsToBudget,
   CAP_HEADROOM_BPS, FLOOR_LANDING_MARGIN_USDS, LIQUIDITY_RESERVE_PERCENT, type MarketLiquidity, type AllocationAction,
@@ -66,6 +67,7 @@ const INFLOW_USDS = parseEther(process.env.SIM_INFLOW_USDS || '0');
 const DEPOSITOR = '0x1111111111111111111111111111111111111111' as Address;
 
 const cfg = parseBandConfig(process.env);
+for (const warning of retiredBandEnvWarnings(process.env)) console.warn(`WARNING: ${warning}`);
 validateBandsMarkets(markets);
 
 interface TenderlyCreds { key: string; account: string; project: string }
@@ -323,13 +325,15 @@ function printState(label: string, s: Snapshot) {
   const sleeveBps = s.totalAssets > 0n ? Number((sleeve * 10000n) / s.totalAssets) : 0;
   console.log(`\n${label} — block ${s.blockNumber}, ${new Date(s.tsSec * 1000).toISOString()}`);
   console.log(`  SSR ${fmtPct(s.ssrApy)} | totalAssets ${fmtM(s.totalAssets)} | sleeve ${fmtM(sleeve)} (${(sleeveBps / 100).toFixed(2)}%) | idle ${fmtM(s.totalAssets - sleeve)}`);
-  console.log('  market            mode     supply     borrow     util     anchor    satAPY   position');
+  console.log('  market            mode     supply     borrow     util     anchor   borrowAPY  position');
   markets.forEach((m, i) => {
-    const util = s.supply[i] > 0n ? Number((s.borrow[i] * 10000n) / s.supply[i]) / 100 : 0;
-    const sat = 0.9 * s.anchorApy[i];
+    const utilWad = s.supply[i] > 0n ? (s.borrow[i] * 10n ** 18n) / s.supply[i] : 0n;
+    const util = Number(utilWad / 10n ** 12n) / 1e4;
+    // The rate borrowers pay right now — the number the controller aims at SSR + margin.
+    const borrowApy = s.anchorApy[i] > 0 ? fmtPct(borrowApyAtUtilization(s.anchorApy[i], utilWad)) : 'n/a';
     console.log(
       `  ${m.name.padEnd(16)}  ${m.mode.padEnd(7)}  ${fmtM(s.supply[i]).padStart(8)}  ${fmtM(s.borrow[i]).padStart(8)}  ` +
-      `${util.toFixed(2).padStart(6)}%  ${fmtPct(s.anchorApy[i]).padStart(7)}  ${fmtPct(sat).padStart(7)}  ${fmtM(s.vaultAssets[i]).padStart(8)}`
+      `${util.toFixed(2).padStart(6)}%  ${fmtPct(s.anchorApy[i]).padStart(7)}  ${borrowApy.padStart(8)}  ${fmtM(s.vaultAssets[i]).padStart(8)}`
     );
   });
 }
@@ -345,7 +349,7 @@ function planCycle(s: Snapshot): { decisions: BandDecision[]; calls: PlannedCall
     index: i,
     name: m.name,
     mode: m.mode,
-    ssrTMarginBps: m.ssrTMarginBps,
+    rateMarginBps: m.rateMarginBps,
     totalSupplyAssets: s.supply[i],
     totalBorrowAssets: s.borrow[i],
     vaultAssets: s.vaultAssets[i],
@@ -385,8 +389,8 @@ function planCycle(s: Snapshot): { decisions: BandDecision[]; calls: PlannedCall
   });
 
   // Deallocations first, liquidity-capped exactly like the executor: a drain may not
-  // push utilization past the market's band; a band-less drain (cap breach) keeps the
-  // flat supply-reserve cushion.
+  // push utilization past the market's target; a drain with no target (cap breach)
+  // keeps the flat supply-reserve cushion.
   const drainLegs = legs.filter(l => l.delta < 0n);
   const drainActions: AllocationAction[] = drainLegs.map(l => ({ marketIndex: l.index, action: 'deallocate', amount: -l.delta }));
   const drainLiquidity: MarketLiquidity[] = drainLegs.map(l => ({

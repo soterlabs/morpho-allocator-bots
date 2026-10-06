@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseBandConfig, computeSsrApy, assertSsrSane } from './band-config.js';
+import { parseBandConfig, retiredBandEnvWarnings, computeSsrApy, assertSsrSane } from './band-config.js';
 
 const WAD = 10n ** 18n;
 
@@ -9,8 +9,10 @@ const REQUIRED = { MAX_ALLOCATE_USDS: '5000000', MAX_DEALLOCATE_USDS: '5000000' 
 describe('parseBandConfig', () => {
   it('applies the production defaults when only required vars are set', () => {
     const cfg = parseBandConfig(REQUIRED);
-    expect(cfg.ssrTMarginBps).toBe(0);
-    expect(cfg.ssrTToleranceBps).toBe(25);
+    expect(cfg.rateMarginBps).toBe(60);
+    expect(cfg.utilMinBps).toBe(8000);
+    expect(cfg.utilMaxBps).toBe(9500);
+    expect(cfg.primaryMinUtilPercent).toBe(80);
     expect(cfg.utilDeadbandBps).toBe(50);
     expect(cfg.minBandActionUsds).toBe(10_000n * WAD);
     expect(cfg.minPriorityWithdrawalUsds).toBe(50_000n * WAD);
@@ -26,13 +28,17 @@ describe('parseBandConfig', () => {
   it('honors explicit overrides (whole-USDS envs are converted to 18-dec)', () => {
     const cfg = parseBandConfig({
       ...REQUIRED,
-      SSR_T_MARGIN_BPS: '40',
-      SSR_T_TOLERANCE_BPS: '30',
+      RATE_MARGIN_BPS: '80',
+      UTIL_MIN_BPS: '8500',
+      UTIL_MAX_BPS: '9700',
+      PRIMARY_MIN_UTIL_PERCENT: '70',
       MIN_BAND_ACTION_USDS: '100000',
       SLEEVE_FLOOR_BPS: '1600',
     });
-    expect(cfg.ssrTMarginBps).toBe(40);
-    expect(cfg.ssrTToleranceBps).toBe(30);
+    expect(cfg.rateMarginBps).toBe(80);
+    expect(cfg.utilMinBps).toBe(8500);
+    expect(cfg.utilMaxBps).toBe(9700);
+    expect(cfg.primaryMinUtilPercent).toBe(70);
     expect(cfg.minBandActionUsds).toBe(100_000n * WAD);
     expect(cfg.sleeveFloorBps).toBe(1600);
   });
@@ -45,6 +51,48 @@ describe('parseBandConfig', () => {
     it('honors an explicit override in whole USDS', () => {
       const cfg = parseBandConfig({ ...REQUIRED, MIN_BAND_ACTION_USDS: '100000' });
       expect(cfg.minBandActionUsds).toBe(100_000n * WAD);
+    });
+  });
+
+  describe('PRIMARY_MIN_UTIL_PERCENT', () => {
+    it('defaults to 80%', () => {
+      expect(parseBandConfig(REQUIRED).primaryMinUtilPercent).toBe(80);
+    });
+
+    it('accepts the inclusive bounds 1 and 100', () => {
+      expect(parseBandConfig({ ...REQUIRED, PRIMARY_MIN_UTIL_PERCENT: '1' }).primaryMinUtilPercent).toBe(1);
+      expect(parseBandConfig({ ...REQUIRED, PRIMARY_MIN_UTIL_PERCENT: '100' }).primaryMinUtilPercent).toBe(100);
+    });
+
+    it('rejects 0 (it would divide the utilization floor by zero) and anything above 100', () => {
+      expect(() => parseBandConfig({ ...REQUIRED, PRIMARY_MIN_UTIL_PERCENT: '0' })).toThrow(/PRIMARY_MIN_UTIL_PERCENT.*\[1, 100\]/);
+      expect(() => parseBandConfig({ ...REQUIRED, PRIMARY_MIN_UTIL_PERCENT: '101' })).toThrow(/PRIMARY_MIN_UTIL_PERCENT.*\[1, 100\]/);
+    });
+
+    it('rejects non-canonical values instead of defaulting', () => {
+      expect(() => parseBandConfig({ ...REQUIRED, PRIMARY_MIN_UTIL_PERCENT: '80.5' })).toThrow(/PRIMARY_MIN_UTIL_PERCENT/);
+      expect(() => parseBandConfig({ ...REQUIRED, PRIMARY_MIN_UTIL_PERCENT: '' })).toThrow(/PRIMARY_MIN_UTIL_PERCENT/);
+    });
+  });
+
+  describe('retired satAPY-ladder knobs', () => {
+    it('ignores SSR_T_* values entirely, even unparseable ones', () => {
+      const cfg = parseBandConfig({ ...REQUIRED, SSR_T_MARGIN_BPS: 'abc', SSR_T_TOLERANCE_BPS: '25' });
+      expect(cfg.rateMarginBps).toBe(60);
+    });
+
+    it('reports every retired knob that is still set, and nothing else', () => {
+      const warnings = retiredBandEnvWarnings({
+        SSR_T_MARGIN_BPS: '0', SSR_T_TOLERANCE_BPS: '25', SSR_T_MARGIN_PTSUSDS_BPS: '10', RATE_MARGIN_BPS: '60',
+      });
+      expect(warnings).toHaveLength(3);
+      expect(warnings[0]).toMatch(/^SSR_T_MARGIN_BPS is set but retired — ignored/);
+      expect(warnings[1]).toMatch(/^SSR_T_TOLERANCE_BPS is set but retired/);
+      expect(warnings[2]).toMatch(/^SSR_T_MARGIN_PTSUSDS_BPS is set but retired/);
+    });
+
+    it('reports nothing on a clean env', () => {
+      expect(retiredBandEnvWarnings(REQUIRED)).toEqual([]);
     });
   });
 
@@ -104,11 +152,11 @@ describe('parseBandConfig', () => {
     });
 
     it('rejects empty strings (present-but-empty is NOT "unset")', () => {
-      expect(() => parseBandConfig({ ...REQUIRED, SSR_T_MARGIN_BPS: '' })).toThrow(/SSR_T_MARGIN_BPS/);
+      expect(() => parseBandConfig({ ...REQUIRED, RATE_MARGIN_BPS: '' })).toThrow(/RATE_MARGIN_BPS/);
     });
 
     it('rejects non-decimal forms', () => {
-      expect(() => parseBandConfig({ ...REQUIRED, SSR_T_TOLERANCE_BPS: '0x10' })).toThrow(/SSR_T_TOLERANCE_BPS/);
+      expect(() => parseBandConfig({ ...REQUIRED, UTIL_MAX_BPS: '0x10' })).toThrow(/UTIL_MAX_BPS/);
       expect(() => parseBandConfig({ ...REQUIRED, MAX_ALLOCATE_USDS: '1e6' })).toThrow(/MAX_ALLOCATE_USDS/);
     });
 
@@ -122,11 +170,17 @@ describe('parseBandConfig', () => {
   });
 
   describe('cross-field validation', () => {
-    it('accepts a tolerance wider than the margin (the zone may dip below SSR)', () => {
-      // The production shape: margin 0, tolerance 25 -> zone [SSR - 25, SSR + 25] bps.
-      const cfg = parseBandConfig({ ...REQUIRED, SSR_T_MARGIN_BPS: '0', SSR_T_TOLERANCE_BPS: '25' });
-      expect(cfg.ssrTMarginBps).toBe(0);
-      expect(cfg.ssrTToleranceBps).toBe(25);
+    it('throws when the utilization clamp is inverted or empty', () => {
+      expect(() => parseBandConfig({ ...REQUIRED, UTIL_MIN_BPS: '9500' })).toThrow(/0 < UTIL_MIN_BPS < UTIL_MAX_BPS/);
+      expect(() => parseBandConfig({ ...REQUIRED, UTIL_MIN_BPS: '9600', UTIL_MAX_BPS: '9500' })).toThrow(/0 < UTIL_MIN_BPS < UTIL_MAX_BPS/);
+    });
+
+    it('throws on a zero utilization floor (the target inversion would divide by zero)', () => {
+      expect(() => parseBandConfig({ ...REQUIRED, UTIL_MIN_BPS: '0' })).toThrow(/0 < UTIL_MIN_BPS < UTIL_MAX_BPS/);
+    });
+
+    it('accepts a clamp reaching 100% utilization', () => {
+      expect(parseBandConfig({ ...REQUIRED, UTIL_MAX_BPS: '10000' }).utilMaxBps).toBe(10000);
     });
 
     it('throws when the sleeve floor is not < 2000 bps', () => {
