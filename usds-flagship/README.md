@@ -52,9 +52,12 @@ targets are replaced by **rate-target steering**: each STEERED market is held
 at the utilization where its **current borrow rate equals SSR + `RATE_MARGIN_BPS`**
 (60 bps by default; SSR read on-chain from `sUSDS.ssr()`, per-market
 override `RATE_MARGIN_<MARKET>_BPS`). The target utilization is the Adaptive
-Curve IRM inverted around the market's anchor (`rateAtTarget`), clamped to
-[`UTIL_MIN_BPS`, `UTIL_MAX_BPS`] = [80%, 95%]. A market whose rate already
-sits within 10 bps of the target rests with no action.
+Curve IRM inverted around the market's anchor (`rateAtTarget`), bounded by
+[`UTIL_MIN_BPS`, `UTIL_MAX_BPS`] = [80%, 95%] in the direction the rate asks
+for: a heating drain stops at 95%, a cooling deposit at 80%. The range bounds
+the bot's own pushes, not the market: one that borrowers moved past a bound
+holds (`R-CLAMP`) until the rate asks for a move back toward it. A market
+whose rate already sits within 10 bps of the target rests with no action.
 
 | regime | target utilization | what it means |
 |---|---|---|

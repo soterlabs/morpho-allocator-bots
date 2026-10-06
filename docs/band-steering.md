@@ -17,7 +17,15 @@ borrowers react to. SSR is read on-chain from `sUSDS.ssr()`
    `RATE_MARGIN_<MARKET>_BPS`).
 2. **Target utilization** `u*` = the utilization at which Morpho's Adaptive
    Curve IRM prices the market at `b*` given its current anchor
-   (`rateAtTarget`), clamped into `[UTIL_MIN_BPS, UTIL_MAX_BPS]` = [80%, 95%].
+   (`rateAtTarget`), bounded by `[UTIL_MIN_BPS, UTIL_MAX_BPS]` = [80%, 95%]
+   in the direction the rate asks for: a heating drain stops at 95%, a
+   cooling deposit at 80%. The range bounds how far the bot itself pushes a
+   market; it is not a fence the bot patrols. A market that borrowers moved
+   past a bound is left there (`R-CLAMP`) until the rate asks for a move back
+   toward the range, which then lands on the exact curve inverse. Pushing it
+   back against the rate would move the rate away from `b*` and spend sleeve
+   budget doing it, while the anchor drift already works in the right
+   direction (the further out, the faster).
    The curve is `borrow = anchor × curve(err)`, `err = (u − 0.9) / 0.1` above
    90% and `(u − 0.9) / 0.9` below, `curve = 1 + 3·err` above and
    `1 + 0.75·err` below — linear in the per-second rate, so the inverse is
@@ -103,12 +111,15 @@ Steering adds three checks of its own around the shared ones, so the order
 per STEERED market is:
 
 1. **rest**: current borrow rate within `b* ± 10 bps` → `R-REST`
-2. **util deadband**: `|utilBps − u*| ≤ 50 bps` → `R-DEADBAND`
-3. min action, direction cooldown (shared)
-4. **monopolist share**: drain while vault share of market supply < 80% →
+2. **clamp**: the bound blocks the only useful direction (util at/above
+   `UTIL_MAX_BPS` with the rate under `b*`, or at/below `UTIL_MIN_BPS` with
+   the rate over it) → `R-CLAMP`
+3. **util deadband**: `|utilBps − u*| ≤ 50 bps` → `R-DEADBAND`
+4. min action, direction cooldown (shared)
+5. **monopolist share**: drain while vault share of market supply < 80% →
    `R-SHARE` (we are not the dominant supplier; draining cannot move util —
    go neutral; grows still allowed)
-5. step caps (shared)
+6. step caps (shared)
 
 A priority withdrawal skips all of this — see below.
 
@@ -256,7 +267,7 @@ change** to pick up rate-target steering.
 | `MIN_PRIORITY_WITHDRAWAL_USDS` | `50000` | smallest priority withdrawal, whole USDS; a smaller breach waits (a zero cap drains from the 100 USDS dust floor instead) |
 | `RATE_MARGIN_BPS` | `60` | target borrow rate = SSR + margin for STEERED markets |
 | `RATE_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
-| `UTIL_MIN_BPS` / `UTIL_MAX_BPS` | `8000` / `9500` | the target utilization is clamped into this range; validated `0 < min < max` |
+| `UTIL_MIN_BPS` / `UTIL_MAX_BPS` | `8000` / `9500` | how far the bot itself pushes a market: a heating drain stops at max, a cooling deposit at min; a market already past a bound holds (`R-CLAMP`); validated `0 < min < max` |
 | `PRIMARY_MIN_UTIL_PERCENT` | `80` | a PRIMARY fill never pushes that market's utilization under this percent (fill target `min(cap, borrow × 100 / this)`); validated in [1, 100] |
 | `SSR_T_MARGIN_BPS`, `SSR_T_TOLERANCE_BPS`, `SSR_T_MARGIN_<MARKET>_BPS` | — | **retired** — ignored whatever they hold; a startup warning names each one still set |
 | `UTIL_DEADBAND_BPS` | `50` | |
@@ -310,6 +321,7 @@ nothing. The cadence is hourly (`0 * * * *` in `railway.toml`).
 | `R-HEAT` | held at a target utilization ≥ 90% (the market is cheap; its anchor drifts up) |
 | `R-COOL` | held at a target utilization < 90% (the market is expensive; its anchor drifts down) |
 | `R-REST` | current borrow rate within `b* ± 10 bps` → no action |
+| `R-CLAMP` | util already at/past the bound in the direction the rate asks for (≥ `UTIL_MAX_BPS` with the rate under `b*`, ≤ `UTIL_MIN_BPS` with it over) → hold; the anchor drift does the work |
 | `R-HOLD` | a PRIMARY market at/above its fill target (cap or utilization floor) |
 | `R-DEADBAND` | util within 50 bps of `u*` → hold (regime `REST` in the trace) |
 | `R-MINACTION` | \|delta\| < $10k → hold (STEERED and PRIMARY) |

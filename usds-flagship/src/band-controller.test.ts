@@ -195,14 +195,119 @@ describe('target utilization clamp', () => {
   it('honors a custom clamp from env', () => {
     const wide = parseBandConfig({ ...{ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000' }, UTIL_MIN_BPS: '8500', UTIL_MAX_BPS: '9700' });
 
-    // Floor 85%: 3.4M / 0.85 = 4.0M. Ceiling 97%: 3.88M / 0.97 = 4.0M.
-    const cooled = decideWith(wide, market({ anchorApy: 0.046, totalBorrowAssets: parseEther('3400000') }));
+    // Floor 85%: the curve wants 77.7%, the deposit stops at 3.4M / 0.85 = 4.0M from
+    // 3.8M (+200k). Ceiling 97%: the drain stops at 3.88M / 0.97 = 4.0M from 4.2M (-200k).
+    const cooled = decideWith(wide, market({
+      anchorApy: 0.046, totalSupplyAssets: parseEther('3800000'), totalBorrowAssets: parseEther('3400000'),
+    }));
     const heated = decideWith(wide, market({ anchorApy: 0.01, totalBorrowAssets: parseEther('3880000') }));
 
     expect(cooled.bandUtilBps).toBe(8500);
-    expect(cooled.targetAmount).toBe(parseEther('3900000'));
+    expect(cooled.targetAmount).toBe(parseEther('4300000'));
     expect(heated.bandUtilBps).toBe(9700);
     expect(heated.targetAmount).toBe(parseEther('3900000'));
+  });
+});
+
+describe("the clamp bounds the bot's own push, never the market", () => {
+  // A cbBTC-like market that borrowers pushed to 97% utilization: 3.7248M borrowed of
+  // 3.84M supply, the vault holding 3.74M (97.4% share). 3.7248M divides cleanly by
+  // both 0.97 and 0.96, so the targets below land on whole USDS.
+  function hotMarket(overrides: Partial<MarketObservation> = {}): MarketObservation {
+    return market({
+      totalSupplyAssets: parseEther('3840000'),
+      totalBorrowAssets: parseEther('3724800'),
+      vaultAssets: parseEther('3740000'),
+      ...overrides,
+    });
+  }
+
+  it('holds a market above UTIL_MAX whose rate is under target: the ceiling blocks the only useful move', () => {
+    // The anchor prices the target at 98%, so at 97% the market pays ~25 bps under it
+    // and the rate asks for MORE utilization. The 95% ceiling sits below the current
+    // 97%: the clamped target would be an 80k deposit that drops the rate another
+    // ~75 bps, so the bot holds and lets the anchor heat on its own.
+    const d = decide(hotMarket({ anchorApy: anchorCharging(TARGET_RATE, 0.98) }));
+
+    expect(d.rule).toBe('R-CLAMP');
+    expect(d.regime).toBe('HEAT');
+    expect(d.bandUtilBps).toBe(9500);
+    expect(d.targetAmount).toBe(parseEther('3740000'));
+    expect(d.reasons).toContain('curve inverse 9800 bps clamped down to UTIL_MAX 9500 bps');
+    expect(d.reasons.at(-1)).toBe(
+      'util 9700 bps already at/above UTIL_MAX 9500 bps and the rate wants it higher ' +
+      '(curve inverse 9800 bps) -> hold, the anchor heats on its own above 90%'
+    );
+  });
+
+  it('holds at exactly UTIL_MAX when the rate is under target (the bound is inclusive)', () => {
+    // 3.8M borrowed of 4.0M supply: 95% on the dot, the anchor pricing the target at
+    // 98%. Any drain would push past the ceiling, so it holds.
+    const d = decide(market({
+      totalSupplyAssets: parseEther('4000000'),
+      totalBorrowAssets: parseEther('3800000'),
+      vaultAssets: parseEther('3900000'),
+      anchorApy: anchorCharging(TARGET_RATE, 0.98),
+    }));
+
+    expect(d.rule).toBe('R-CLAMP');
+    expect(d.targetAmount).toBe(parseEther('3900000'));
+  });
+
+  it('rests a market above UTIL_MAX whose rate is on target: the range is not a fence', () => {
+    const d = decide(hotMarket({ anchorApy: anchorCharging(TARGET_RATE, 0.97) }));
+
+    expect(d.rule).toBe('R-REST');
+    expect(d.targetAmount).toBe(parseEther('3740000'));
+  });
+
+  it('cools a market above UTIL_MAX to the exact curve inverse, not down to the ceiling', () => {
+    // The anchor prices the target at 96%, so at 97% the market pays ~45 bps over it.
+    // The deposit lands on 96% — supply 3.7248M / 0.96 = 3.88M, +40k — and not on the
+    // 95% ceiling, which would overshoot the rate by ~45 bps for an extra 40k.
+    const d = decide(hotMarket({ anchorApy: anchorCharging(TARGET_RATE, 0.96) }));
+
+    expect(d.rule).toBe('R-HEAT');
+    expect(d.bandUtilBps).toBe(9600);
+    expect(d.targetAmount).toBe(parseEther('3780000'));
+    expect(d.reasons).not.toContainEqual(expect.stringContaining('clamped'));
+  });
+
+  it('holds a market under UTIL_MIN whose rate is over target: the floor blocks the only useful move', () => {
+    // 3.72M borrowed of 4.96M supply (75%), the anchor pricing the target at 70%: the
+    // market pays ~21 bps over it, so the rate asks for LESS utilization. The 80% floor
+    // sits above the current 75%: the clamped target would be a 310k drain that lifts
+    // the rate further, so the bot holds and lets the anchor cool on its own.
+    const d = decide(market({
+      totalSupplyAssets: parseEther('4960000'),
+      vaultAssets: parseEther('4860000'),
+      anchorApy: anchorCharging(TARGET_RATE, 0.70),
+    }));
+
+    expect(d.rule).toBe('R-CLAMP');
+    expect(d.regime).toBe('COOL');
+    expect(d.bandUtilBps).toBe(8000);
+    expect(d.targetAmount).toBe(parseEther('4860000'));
+    expect(d.reasons.at(-1)).toBe(
+      'util 7500 bps already at/below UTIL_MIN 8000 bps and the rate wants it lower ' +
+      '(curve inverse 7000 bps) -> hold, the anchor cools on its own below 90%'
+    );
+  });
+
+  it('heats a market under UTIL_MIN back toward the range at the exact curve inverse', () => {
+    // 3.1875M borrowed of 4.25M supply (75%), the anchor pricing the target at 85%:
+    // the market pays ~37 bps under it. The drain lands on 85% — supply 3.75M, -500k —
+    // a move INTO the range, so the floor has nothing to say.
+    const d = decide(market({
+      totalSupplyAssets: parseEther('4250000'),
+      totalBorrowAssets: parseEther('3187500'),
+      vaultAssets: parseEther('4150000'),
+      anchorApy: anchorCharging(TARGET_RATE, 0.85),
+    }));
+
+    expect(d.rule).toBe('R-COOL');
+    expect(d.bandUtilBps).toBe(8500);
+    expect(d.targetAmount).toBe(parseEther('3650000'));
   });
 });
 

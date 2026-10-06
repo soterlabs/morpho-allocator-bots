@@ -21,14 +21,18 @@
  *   2. Steering (STEERED): the market is held at the utilization u* where its
  *      CURRENT borrow rate equals the target rate SSR + margin — the number borrowers
  *      react to — found by inverting the Adaptive Curve IRM around the anchor
- *      (irm-curve.ts) and clamped into [utilMinBps, utilMaxBps]. u* is inverted
- *      into an absolute vault target (targetSupply = ceil(borrow / u*)). A market
- *      whose rate already sits within RATE_REST_HALF_WIDTH_BPS of the target RESTs.
+ *      (irm-curve.ts). [utilMinBps, utilMaxBps] bounds how far the bot itself pushes
+ *      the market (a heating drain stops at utilMaxBps, a cooling deposit at
+ *      utilMinBps); it is never a reason to push the other way, so a market that
+ *      borrowers moved past a bound holds until the rate asks for a move back in.
+ *      u* is inverted into an absolute vault target (targetSupply = ceil(borrow / u*)).
+ *      A market whose rate already sits within RATE_REST_HALF_WIDTH_BPS of the target
+ *      RESTs.
  *
  * Rules 1 and 2 size their wish through the same three steps, called in order:
  * boundTarget (the deposit ceiling), sizeGate (min action, direction cooldown),
- * clampToStepCaps. Steering adds the rate rest check and the utilization deadband
- * before and the monopolist share after the shared gate.
+ * clampToStepCaps. Steering adds the rate rest check, the clamp gate and the
+ * utilization deadband before and the monopolist share after the shared gate.
  *
  * RETIRED markets are never touched — not even above their cap. SOUNDING is rejected
  * at startup (market-config.ts parseMarketMode) and defensively rejected here too.
@@ -96,7 +100,7 @@ export type Regime = 'HEAT' | 'REST' | 'COOL';
 /** Machine-readable trace key for the decision a market ended on. */
 export type BandRule =
   | 'R-HEAT' | 'R-REST' | 'R-COOL'
-  | 'R-HOLD' | 'R-DEADBAND' | 'R-MINACTION' | 'R-COOLDOWN' | 'R-SHARE' | 'R-RETIRED'
+  | 'R-HOLD' | 'R-CLAMP' | 'R-DEADBAND' | 'R-MINACTION' | 'R-COOLDOWN' | 'R-SHARE' | 'R-RETIRED'
   | 'R-PRIORITY-DEPOSIT' | 'R-PRIORITY-WITHDRAWAL';
 
 export interface BandDecision {
@@ -173,23 +177,52 @@ function utilizationWad(totalSupplyAssets: bigint, totalBorrowAssets: bigint): b
 }
 
 /**
- * Target utilization u* for a steered market: the utilization at which the IRM
- * prices the market at `rateApy` given its anchor, clamped into
- * [utilMinBps, utilMaxBps]. The clamp is recorded in reasons; an unreachable target
- * (above 4 x anchor, below anchor / 4) saturates at the curve's end and so lands on
- * the clamp too.
+ * Target utilization u* for a steered market whose curve inverse (the utilization at
+ * which the IRM prices it at the target rate) is `curveUtilBps`, bounded in the
+ * direction the rate asks for: a heating drain (curve inverse above the current
+ * utilization) stops at utilMaxBps, a cooling deposit at utilMinBps. The bound limits
+ * how far the bot itself pushes the market — it is not a range the bot patrols, so a
+ * move back toward the range lands on the exact curve inverse even when that is
+ * outside it, and a market already past the bound in the asked-for direction is held
+ * by clampGate. The bound is recorded in reasons; an unreachable target (above
+ * 4 x anchor, below anchor / 4) saturates at the curve's end and so lands on it too.
  */
-function targetUtilization(m: MarketObservation, cfg: BandConfig, rateApy: number, reasons: string[]): number {
-  const raw = utilizationBpsForBorrowApy(rateApy, m.anchorApy);
-  if (raw < cfg.utilMinBps) {
-    reasons.push(`curve inverse ${raw} bps clamped up to UTIL_MIN ${cfg.utilMinBps} bps`);
-    return cfg.utilMinBps;
-  }
-  if (raw > cfg.utilMaxBps) {
-    reasons.push(`curve inverse ${raw} bps clamped down to UTIL_MAX ${cfg.utilMaxBps} bps`);
+function targetUtilization(utilBps: number, curveUtilBps: number, cfg: BandConfig, reasons: string[]): number {
+  if (curveUtilBps > utilBps && curveUtilBps > cfg.utilMaxBps) {
+    reasons.push(`curve inverse ${curveUtilBps} bps clamped down to UTIL_MAX ${cfg.utilMaxBps} bps`);
     return cfg.utilMaxBps;
   }
-  return raw;
+  if (curveUtilBps < utilBps && curveUtilBps < cfg.utilMinBps) {
+    reasons.push(`curve inverse ${curveUtilBps} bps clamped up to UTIL_MIN ${cfg.utilMinBps} bps`);
+    return cfg.utilMinBps;
+  }
+  return curveUtilBps;
+}
+
+/**
+ * Steering gate: the bound blocks the only useful direction -> R-CLAMP. A market at or
+ * past UTIL_MAX whose rate is under the target would need an even hotter utilization;
+ * one at or past UTIL_MIN whose rate is over it would need a colder one. Pushing it
+ * back into the range would move the rate AWAY from the target (and spend sleeve
+ * budget doing so), so the bot holds and leaves the move to the anchor drift, which
+ * works in the right direction on both sides of 90% — the faster the further out.
+ */
+function clampGate(utilBps: number, curveUtilBps: number, targetUtilBps: number, cfg: BandConfig): Hold | undefined {
+  if (curveUtilBps > utilBps && targetUtilBps <= utilBps) {
+    return {
+      rule: 'R-CLAMP',
+      why: `util ${utilBps} bps already at/above UTIL_MAX ${cfg.utilMaxBps} bps and the rate wants it higher ` +
+        `(curve inverse ${curveUtilBps} bps) -> hold, the anchor heats on its own above 90%`,
+    };
+  }
+  if (curveUtilBps < utilBps && targetUtilBps >= utilBps) {
+    return {
+      rule: 'R-CLAMP',
+      why: `util ${utilBps} bps already at/below UTIL_MIN ${cfg.utilMinBps} bps and the rate wants it lower ` +
+        `(curve inverse ${curveUtilBps} bps) -> hold, the anchor cools on its own below 90%`,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -370,12 +403,12 @@ function decidePriorityDeposit(m: MarketObservation, cfg: BandConfig, nowSec: nu
 
 /**
  * Steering (STEERED): aim the market's borrow rate at SSR + margin. The target
- * utilization u* is the curve inverse of that rate around the anchor, clamped; a
- * market whose current rate is already within RATE_REST_HALF_WIDTH_BPS of the target
- * RESTs with no action. Otherwise u* is inverted into an absolute vault target and
- * the wish is sized through the shared steps, with the two steering-only gates
- * around the shared one (each hold carries its own rule):
- * rest -> deadband -> min action -> cooldown -> share -> step caps.
+ * utilization u* is the curve inverse of that rate around the anchor, bounded in the
+ * asked-for direction (targetUtilization); a market whose current rate is already
+ * within RATE_REST_HALF_WIDTH_BPS of the target RESTs with no action. Otherwise u*
+ * is inverted into an absolute vault target and the wish is sized through the shared
+ * steps, with the three steering-only gates around the shared one (each hold carries
+ * its own rule): rest -> clamp -> deadband -> min action -> cooldown -> share -> step caps.
  */
 function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, nowSec: number): BandDecision {
   if (!Number.isFinite(m.anchorApy) || m.anchorApy <= 0 || m.anchorApy > MAX_SANE_ANCHOR_APY) {
@@ -393,7 +426,8 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
   const utilBps = utilizationBps(m.totalSupplyAssets, m.totalBorrowAssets);
   const borrowApyNow = borrowApyAtUtilization(m.anchorApy, utilizationWad(m.totalSupplyAssets, m.totalBorrowAssets));
   const deviationBps = Math.round((borrowApyNow - rateApy) * 10000);
-  const targetUtilBps = targetUtilization(m, cfg, rateApy, reasons);
+  const curveUtilBps = utilizationBpsForBorrowApy(rateApy, m.anchorApy);
+  const targetUtilBps = targetUtilization(utilBps, curveUtilBps, cfg, reasons);
   reasons.unshift(
     `target rate ${fmtPct(rateApy)} = SSR ${fmtPct(ssrApy)} + ${marginBps} bps` +
     `${m.rateMarginBps !== undefined ? ' (per-market override)' : ''}; ` +
@@ -408,6 +442,8 @@ function decideSteered(m: MarketObservation, cfg: BandConfig, ssrApy: number, no
   }
   const regime: Regime = targetUtilBps >= IRM_TARGET_UTIL_BPS ? 'HEAT' : 'COOL';
   const steering: SteeringTarget = { rateApy, utilBps: targetUtilBps, regime };
+  const clamp = clampGate(utilBps, curveUtilBps, targetUtilBps, cfg);
+  if (clamp) return holdAt(m, clamp.rule, [...reasons, clamp.why], steering);
 
   // Invert u* into an absolute vault target; ceil keeps the resulting utilization
   // from rounding ABOVE the target.
