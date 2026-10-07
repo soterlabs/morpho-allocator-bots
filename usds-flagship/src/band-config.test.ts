@@ -12,7 +12,7 @@ describe('parseBandConfig', () => {
     expect(cfg.rateMarginBps).toBe(60);
     expect(cfg.utilMinBps).toBe(8000);
     expect(cfg.utilMaxBps).toBe(9500);
-    expect(cfg.primaryMinUtilPercent).toBe(80);
+    expect(cfg.primaryMinUtilPercent).toBe(86);
     expect(cfg.utilDeadbandBps).toBe(50);
     expect(cfg.minBandActionUsds).toBe(10_000n * WAD);
     expect(cfg.minPriorityWithdrawalUsds).toBe(50_000n * WAD);
@@ -55,8 +55,8 @@ describe('parseBandConfig', () => {
   });
 
   describe('PRIMARY_MIN_UTIL_PERCENT', () => {
-    it('defaults to 80%', () => {
-      expect(parseBandConfig(REQUIRED).primaryMinUtilPercent).toBe(80);
+    it('defaults to 86%', () => {
+      expect(parseBandConfig(REQUIRED).primaryMinUtilPercent).toBe(86);
     });
 
     it('accepts the inclusive bounds 1 and 100', () => {

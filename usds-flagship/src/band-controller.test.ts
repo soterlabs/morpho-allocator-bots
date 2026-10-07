@@ -649,9 +649,10 @@ describe('per-market rate margin override', () => {
 
 /**
  * PT-sUSDS/USDS as observed live on 2026-08-23, in its PRIMARY role: 2.415M supply
- * (all of it the vault's), 2.198M borrow (util 91%), anchor 2.93%. Cap 4.04M =
- * min(10% x TVL, 5M USDS). The 80% utilization floor sits at supply 2.198M / 0.8 =
- * 2.7475M, under the cap, so the fill wish is 332.5k — not the 1.625M gap to the cap.
+ * (all of it the vault's), 2.193M borrow (util 91%; rounded from 2.198M so the floor
+ * lands on whole USDS), anchor 2.93%. Cap 4.04M = min(10% x TVL, 5M USDS). The 86%
+ * utilization floor sits at supply 2.193M / 0.86 = 2.55M, under the cap, so the fill
+ * wish is 135k — not the 1.625M gap to the cap.
  */
 function ptPrimary(overrides: Partial<MarketObservation> = {}): MarketObservation {
   return market({
@@ -659,7 +660,7 @@ function ptPrimary(overrides: Partial<MarketObservation> = {}): MarketObservatio
     name: 'PT-sUSDS/USDS',
     mode: 'PRIMARY',
     totalSupplyAssets: parseEther('2415000'),
-    totalBorrowAssets: parseEther('2198000'),
+    totalBorrowAssets: parseEther('2193000'),
     vaultAssets: parseEther('2415000'),
     anchorApy: 0.0293,
     marketCap: parseEther('4040000'),
@@ -669,8 +670,8 @@ function ptPrimary(overrides: Partial<MarketObservation> = {}): MarketObservatio
 }
 
 /**
- * The same market pinned at 100% utilization: 9.9M supply fully borrowed, so the 80%
- * floor sits at supply 12.375M and only the cap (20M) or the step cap bounds a fill.
+ * The same market pinned at 100% utilization: 9.9M supply fully borrowed, so the 86%
+ * floor sits at supply ~11.5M, a ~1.6M gap: the 1M step cap bounds every fill.
  */
 function ptPinned(overrides: Partial<MarketObservation> = {}): MarketObservation {
   return ptPrimary({
@@ -691,31 +692,31 @@ describe('priority deposit (PRIMARY)', () => {
     expect(d.priority).toBe(true);
     expect(d.bandUtilBps).toBeUndefined();
     expect(d.regime).toBeUndefined();
-    expect(d.targetAmount).toBe(parseEther('2747500'));
+    expect(d.targetAmount).toBe(parseEther('2550000'));
     expect(d.reasons[0]).toBe(
-      'mode=PRIMARY: fill to min(effectiveCap 4040000 USDS, util floor 2747500 USDS = position at 80% util ' +
-      'on borrow 2198000 USDS) from 2415000 USDS (delta +332500 USDS)');
+      'mode=PRIMARY: fill to min(effectiveCap 4040000 USDS, util floor 2550000 USDS = position at 86% util ' +
+      'on borrow 2193000 USDS) from 2415000 USDS (delta +135000 USDS)');
   });
 
   it('fills to its effective cap when the cap is below the utilization floor', () => {
-    const d = decide(ptPrimary({ effectiveCap: parseEther('2700000') }));
+    const d = decide(ptPrimary({ effectiveCap: parseEther('2500000') }));
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
     expect(d.priority).toBe(true);
-    expect(d.targetAmount).toBe(parseEther('2700000'));
+    expect(d.targetAmount).toBe(parseEther('2500000'));
   });
 
   it('holds exactly at the utilization floor', () => {
-    const d = decide(ptPrimary({ totalSupplyAssets: parseEther('2747500'), vaultAssets: parseEther('2747500') }));
+    const d = decide(ptPrimary({ totalSupplyAssets: parseEther('2550000'), vaultAssets: parseEther('2550000') }));
 
     expect(d.rule).toBe('R-HOLD');
     expect(d.priority).toBe(false);
-    expect(d.targetAmount).toBe(parseEther('2747500'));
-    expect(d.reasons.at(-1)).toBe('at/above the 80% util floor -> hold');
+    expect(d.targetAmount).toBe(parseEther('2550000'));
+    expect(d.reasons.at(-1)).toBe('at/above the 86% util floor -> hold');
   });
 
   it('holds above the utilization floor — the floor is never a withdrawal trigger', () => {
-    // The 2026-10-05 shape: the position sits far above borrow / 0.8 (util 73%), so
+    // The 2026-10-05 shape: the position sits far above borrow / 0.86 (util 73%), so
     // PT asks for nothing and keeps what it has; room appears only as its borrow grows.
     const d = decide(ptPrimary({ totalSupplyAssets: parseEther('3000000'), vaultAssets: parseEther('3000000') }));
 
@@ -754,18 +755,18 @@ describe('priority deposit (PRIMARY)', () => {
   });
 
   it('holds a fill to the floor just under the 10k min action', () => {
-    const d = decide(ptPrimary({ totalSupplyAssets: parseEther('2737501'), vaultAssets: parseEther('2737501') }));
+    const d = decide(ptPrimary({ totalSupplyAssets: parseEther('2540001'), vaultAssets: parseEther('2540001') }));
 
     expect(d.rule).toBe('R-MINACTION');
     expect(d.priority).toBe(false);
-    expect(d.targetAmount).toBe(parseEther('2737501'));
+    expect(d.targetAmount).toBe(parseEther('2540001'));
   });
 
   it('executes a fill to the floor of exactly the 10k min action', () => {
-    const d = decide(ptPrimary({ totalSupplyAssets: parseEther('2737500'), vaultAssets: parseEther('2737500') }));
+    const d = decide(ptPrimary({ totalSupplyAssets: parseEther('2540000'), vaultAssets: parseEther('2540000') }));
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
-    expect(d.targetAmount).toBe(parseEther('2747500'));
+    expect(d.targetAmount).toBe(parseEther('2550000'));
   });
 
   it('holds a fill to the cap just under the 10k min action', () => {
@@ -785,12 +786,12 @@ describe('priority deposit (PRIMARY)', () => {
   });
 
   it('follows PRIMARY_MIN_UTIL_PERCENT from env', () => {
-    // A 70% floor sits at supply 2.198M / 0.7 = 3.14M: a 725k fill instead of 332.5k.
-    const loose = parseBandConfig({ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000', PRIMARY_MIN_UTIL_PERCENT: '70' });
+    // A 75% floor sits at supply 2.193M / 0.75 = 2.924M: a 509k fill instead of 135k.
+    const loose = parseBandConfig({ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000', PRIMARY_MIN_UTIL_PERCENT: '75' });
     const d = decideWith(loose, ptPrimary());
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
-    expect(d.targetAmount).toBe(parseEther('3140000'));
+    expect(d.targetAmount).toBe(parseEther('2924000'));
   });
 
   it('holds a fill within 24h of the last deallocate (direction cooldown)', () => {
@@ -805,18 +806,18 @@ describe('priority deposit (PRIMARY)', () => {
     const d = decide(ptPrimary({ lastDeallocateAtSec: NOW - 24 * 3600 }));
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
-    expect(d.targetAmount).toBe(parseEther('2747500'));
+    expect(d.targetAmount).toBe(parseEther('2550000'));
   });
 
   it('keeps filling right after an earlier fill (same direction, no cooldown)', () => {
     const d = decide(ptPrimary({ lastAllocateAtSec: NOW - 3600 }));
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
-    expect(d.targetAmount).toBe(parseEther('2747500'));
+    expect(d.targetAmount).toBe(parseEther('2550000'));
   });
 
   it('clamps the fill to the MAX_ALLOCATE step cap', () => {
-    // Pinned at 100%: the floor wants supply 12.375M, a 2.475M gap, one 1M step at a time.
+    // Pinned at 100%: the floor wants supply ~11.5M, a ~1.6M gap, one 1M step at a time.
     const d = decide(ptPinned());
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
@@ -831,7 +832,7 @@ describe('priority deposit (PRIMARY)', () => {
 
     expect(cold).toEqual(hot);
     expect(cold.rule).toBe('R-PRIORITY-DEPOSIT');
-    expect(cold.targetAmount).toBe(parseEther('2747500'));
+    expect(cold.targetAmount).toBe(parseEther('2550000'));
   });
 
   it('does not throw on a garbage anchor read (the anchor is never consulted)', () => {
@@ -845,7 +846,7 @@ describe('priority deposit (PRIMARY)', () => {
 
     expect(d.rule).toBe('R-PRIORITY-DEPOSIT');
     expect(d.priority).toBe(true);
-    expect(d.targetAmount).toBe(parseEther('2747500'));
+    expect(d.targetAmount).toBe(parseEther('2550000'));
   });
 });
 
@@ -864,7 +865,7 @@ describe('shared wish sizing (PRIMARY and STEERED)', () => {
   });
 
   it('clamps a PRIMARY fill and a STEERED grow of the same size to MAX_ALLOCATE with one trace', () => {
-    // A 1.1M gap on both sides: PRIMARY pinned at 100% to an 11M cap (under its 12.375M
+    // A 1.1M gap on both sides: PRIMARY pinned at 100% to an 11M cap (under its ~11.5M
     // floor), STEERED pinned at 100% with the anchor on target (the rest point wants
     // supply 11M from 9.9M). Each moves the 1M step cap.
     const primary = decide(ptPinned({ effectiveCap: parseEther('11000000') }));
@@ -942,13 +943,13 @@ describe('priority withdrawal (cap breach)', () => {
   });
 
   it('clamps the drain to the pool\'s withdrawable liquidity after the 5% reserve', () => {
-    // Live PT-sUSDS: 2.415M supply - 2.198M borrow = 217k idle, minus the 5% reserve
-    // of 120.75k -> 96.25k withdrawable, against a 415k breach of a 2.0M cap.
+    // Live PT-sUSDS: 2.415M supply - 2.193M borrow = 222k idle, minus the 5% reserve
+    // of 120.75k -> 101.25k withdrawable, against a 415k breach of a 2.0M cap.
     const d = decide(ptPrimary({ marketCap: parseEther('2000000') }));
 
     expect(d.rule).toBe('R-PRIORITY-WITHDRAWAL');
     expect(d.priority).toBe(true);
-    expect(d.targetAmount).toBe(parseEther('2318750'));
+    expect(d.targetAmount).toBe(parseEther('2313750'));
   });
 
   it('holds with the priority-withdrawal rule when the pool has no withdrawable liquidity', () => {
@@ -1032,7 +1033,7 @@ describe('priority withdrawal (cap breach)', () => {
   });
 
   it('drains a PRIMARY market above its cap through the same rule', () => {
-    // A 65k breach the pool's 96.25k withdrawable covers in full.
+    // A 65k breach the pool's 101.25k withdrawable covers in full.
     const d = decide(ptPrimary({ marketCap: parseEther('2350000') }));
 
     expect(d.rule).toBe('R-PRIORITY-WITHDRAWAL');

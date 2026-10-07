@@ -159,7 +159,7 @@ function parsePercent(raw: string | undefined, defaultValue: number, label: stri
  *                                 (8000 / 9500): below 80% a market is pure dilution,
  *                                 above 95% its idle liquidity is too thin to drain
  *   PRIMARY_MIN_UTIL_PERCENT    — a PRIMARY fill stops where that market's utilization
- *                                 would drop under this (80), so it tracks its own
+ *                                 would drop under this (86), so it tracks its own
  *                                 borrow demand instead of absorbing every freed dollar
  *   UTIL_DEADBAND_BPS           — no action within +-deadband of the target utilization (50)
  *   MIN_BAND_ACTION_USDS        — smaller steering legs / priority deposits are dropped, whole USDS (10000)
@@ -183,7 +183,7 @@ export function parseBandConfig(env: Record<string, string | undefined>): BandCo
     rateMarginBps: parseBps(env.RATE_MARGIN_BPS, 60, 'RATE_MARGIN_BPS'),
     utilMinBps: parseBps(env.UTIL_MIN_BPS, 8000, 'UTIL_MIN_BPS'),
     utilMaxBps: parseBps(env.UTIL_MAX_BPS, 9500, 'UTIL_MAX_BPS'),
-    primaryMinUtilPercent: parsePercent(env.PRIMARY_MIN_UTIL_PERCENT, 80, 'PRIMARY_MIN_UTIL_PERCENT'),
+    primaryMinUtilPercent: parsePercent(env.PRIMARY_MIN_UTIL_PERCENT, 86, 'PRIMARY_MIN_UTIL_PERCENT'),
     utilDeadbandBps: parseBps(env.UTIL_DEADBAND_BPS, 50, 'UTIL_DEADBAND_BPS'),
     minBandActionUsds: parseWholeUsds(env.MIN_BAND_ACTION_USDS, 10_000n, 'MIN_BAND_ACTION_USDS'),
     minPriorityWithdrawalUsds: parseWholeUsds(env.MIN_PRIORITY_WITHDRAWAL_USDS, 50_000n, 'MIN_PRIORITY_WITHDRAWAL_USDS'),

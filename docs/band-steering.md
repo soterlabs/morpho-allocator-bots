@@ -175,13 +175,15 @@ reconciliation serves before any other deposit:
 `fillTarget = min(effectiveCap, position at PRIMARY_MIN_UTIL_PERCENT utilization)`
 
 where the second term is the vault position at which the market's supply
-would be `borrow × 100 / PRIMARY_MIN_UTIL_PERCENT` (80% → `borrow / 0.80`).
+would be `borrow × 100 / PRIMARY_MIN_UTIL_PERCENT` (86% → `borrow / 0.86`).
 The floor makes PT track its own borrow demand (looper activity) instead of
-absorbing every dollar the steered markets free: on 2026-10-05 PT held $3.42M
-against $2.26M borrow (66% util), so its fill target was $2.83M and it asked
-for nothing — budget freed by HEAT withdrawals stays idle inside the sleeve
-and funds later COOL deposits in cbBTC / wstETH. PT grows again only as its
-borrow grows.
+absorbing every dollar the steered markets free: on 2026-10-07 PT held $3.66M
+against $3.09M borrow (84% util) with $210k of cap room, so its fill target
+was $3.59M and it asked for nothing — budget freed by HEAT withdrawals or by
+new sleeve room stays idle inside the sleeve and funds COOL deposits in
+cbBTC / wstETH. PT grows again only as its borrow grows. 86% keeps PT under
+the IRM's 90% target (its rate keeps easing) with 14% of supply free for
+loopers to borrow.
 
 The floor is a **deposit-time guard only**: a position above it holds
 (`R-HOLD`), it is never a withdrawal trigger (PT's excess above the floor is
@@ -268,7 +270,7 @@ change** to pick up rate-target steering.
 | `RATE_MARGIN_BPS` | `60` | target borrow rate = SSR + margin for STEERED markets |
 | `RATE_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
 | `UTIL_MIN_BPS` / `UTIL_MAX_BPS` | `8000` / `9500` | how far the bot itself pushes a market: a heating drain stops at max, a cooling deposit at min; a market already past a bound holds (`R-CLAMP`); validated `0 < min < max` |
-| `PRIMARY_MIN_UTIL_PERCENT` | `80` | a PRIMARY fill never pushes that market's utilization under this percent (fill target `min(cap, borrow × 100 / this)`); validated in [1, 100] |
+| `PRIMARY_MIN_UTIL_PERCENT` | `86` | a PRIMARY fill never pushes that market's utilization under this percent (fill target `min(cap, borrow × 100 / this)`); validated in [1, 100] |
 | `SSR_T_MARGIN_BPS`, `SSR_T_TOLERANCE_BPS`, `SSR_T_MARGIN_<MARKET>_BPS` | — | **retired** — ignored whatever they hold; a startup warning names each one still set |
 | `UTIL_DEADBAND_BPS` | `50` | |
 | `MIN_BAND_ACTION_USDS` | `10000` | whole USDS; smallest steering leg or priority deposit |
