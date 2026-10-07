@@ -3,15 +3,16 @@ import { parseEther } from 'viem';
 import { computeBandDecisions, type MarketObservation } from './band-controller.js';
 import { parseBandConfig, type BandConfig } from './band-config.js';
 
-// Production rate shape: SSR 3.52% -> target borrow rate 4.12% at the default 60 bps
-// margin; a market resting within +-10 bps of it ([4.02%, 4.22%]) is left alone.
+// Production rate shape: SSR 3.52% -> target borrow rate 4.12% at a 60 bps margin
+// (pinned below, so the fixtures do not move with the default); a market resting
+// within +-10 bps of it ([4.02%, 4.22%]) is left alone.
 const SSR_APY = 0.0352;
 const TARGET_RATE = SSR_APY + 60 / 10000;
 
-// Defaults (margin 60, target utilization clamped to [8000, 9500], PRIMARY floor 80%,
-// deadband 50, min action 10k, min priority withdrawal 50k, cooldown 24h, monopolist
-// 8000) plus 1M step caps.
-const cfg = parseBandConfig({ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000' });
+// Defaults (target utilization clamped to [8000, 9500], PRIMARY floor 86%, deadband 50,
+// min action 10k, min priority withdrawal 50k, cooldown 24h, monopolist 8000) plus a
+// 60 bps margin and 1M step caps.
+const cfg = parseBandConfig({ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000', RATE_MARGIN_BPS: '60' });
 
 const NOW = 1_785_628_800; // 2026-08-02T00:00:00Z
 
@@ -193,7 +194,7 @@ describe('target utilization clamp', () => {
   });
 
   it('honors a custom clamp from env', () => {
-    const wide = parseBandConfig({ ...{ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000' }, UTIL_MIN_BPS: '8500', UTIL_MAX_BPS: '9700' });
+    const wide = parseBandConfig({ MAX_ALLOCATE_USDS: '1000000', MAX_DEALLOCATE_USDS: '1000000', RATE_MARGIN_BPS: '60', UTIL_MIN_BPS: '8500', UTIL_MAX_BPS: '9700' });
 
     // Floor 85%: the curve wants 77.7%, the deposit stops at 3.4M / 0.85 = 4.0M from
     // 3.8M (+200k). Ceiling 97%: the drain stops at 3.88M / 0.97 = 4.0M from 4.2M (-200k).

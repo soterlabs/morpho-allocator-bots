@@ -9,7 +9,7 @@ const REQUIRED = { MAX_ALLOCATE_USDS: '5000000', MAX_DEALLOCATE_USDS: '5000000' 
 describe('parseBandConfig', () => {
   it('applies the production defaults when only required vars are set', () => {
     const cfg = parseBandConfig(REQUIRED);
-    expect(cfg.rateMarginBps).toBe(60);
+    expect(cfg.rateMarginBps).toBe(110);
     expect(cfg.utilMinBps).toBe(8000);
     expect(cfg.utilMaxBps).toBe(9500);
     expect(cfg.primaryMinUtilPercent).toBe(86);
@@ -78,7 +78,7 @@ describe('parseBandConfig', () => {
   describe('retired satAPY-ladder knobs', () => {
     it('ignores SSR_T_* values entirely, even unparseable ones', () => {
       const cfg = parseBandConfig({ ...REQUIRED, SSR_T_MARGIN_BPS: 'abc', SSR_T_TOLERANCE_BPS: '25' });
-      expect(cfg.rateMarginBps).toBe(60);
+      expect(cfg.rateMarginBps).toBe(110);
     });
 
     it('reports every retired knob that is still set, and nothing else', () => {
