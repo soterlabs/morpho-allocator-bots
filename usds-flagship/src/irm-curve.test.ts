@@ -5,7 +5,7 @@ import { apyToPerSecWad, borrowApyAtUtilization, utilizationBpsForBorrowApy } fr
 const WAD = 10n ** 18n;
 const utilWad = (fraction: number) => BigInt(Math.round(fraction * 10000)) * WAD / 10000n;
 
-// Production shape on 2026-10-05: SSR 3.60% -> target 4.20% at the default 60 bps margin.
+// Production shape on 2026-10-05: SSR 3.60% -> target 4.20% at a 60 bps margin.
 const TARGET_4_20 = 0.042;
 
 describe('apyToPerSecWad', () => {

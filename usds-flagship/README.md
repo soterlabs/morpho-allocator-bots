@@ -50,7 +50,7 @@ The strategy above is the `bps` mode of a required `ALLOCATION_MODE` env
 (`bps` | `bands`, no default). In **bands** mode the static per-market bps
 targets are replaced by **rate-target steering**: each STEERED market is held
 at the utilization where its **current borrow rate equals SSR + `RATE_MARGIN_BPS`**
-(60 bps by default; SSR read on-chain from `sUSDS.ssr()`, per-market
+(110 bps by default; SSR read on-chain from `sUSDS.ssr()`, per-market
 override `RATE_MARGIN_<MARKET>_BPS`). The target utilization is the Adaptive
 Curve IRM inverted around the market's anchor (`rateAtTarget`), bounded by
 [`UTIL_MIN_BPS`, `UTIL_MAX_BPS`] = [80%, 95%] in the direction the rate asks

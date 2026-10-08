@@ -152,7 +152,7 @@ function parsePercent(raw: string | undefined, defaultValue: number, label: stri
  * Parse and validate the full band-steering configuration from an env record.
  *
  * Env vars and defaults:
- *   RATE_MARGIN_BPS             — target borrow rate = SSR + margin (60); a per-market
+ *   RATE_MARGIN_BPS             — target borrow rate = SSR + margin (110); a per-market
  *                                 RATE_MARGIN_<MARKET>_BPS override is parsed with the
  *                                 market table (market-config.ts)
  *   UTIL_MIN_BPS / UTIL_MAX_BPS — the target utilization is clamped into this range
@@ -180,7 +180,7 @@ function parsePercent(raw: string | undefined, defaultValue: number, label: stri
  */
 export function parseBandConfig(env: Record<string, string | undefined>): BandConfig {
   const cfg: BandConfig = {
-    rateMarginBps: parseBps(env.RATE_MARGIN_BPS, 60, 'RATE_MARGIN_BPS'),
+    rateMarginBps: parseBps(env.RATE_MARGIN_BPS, 110, 'RATE_MARGIN_BPS'),
     utilMinBps: parseBps(env.UTIL_MIN_BPS, 8000, 'UTIL_MIN_BPS'),
     utilMaxBps: parseBps(env.UTIL_MAX_BPS, 9500, 'UTIL_MAX_BPS'),
     primaryMinUtilPercent: parsePercent(env.PRIMARY_MIN_UTIL_PERCENT, 86, 'PRIMARY_MIN_UTIL_PERCENT'),
