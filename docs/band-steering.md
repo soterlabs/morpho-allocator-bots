@@ -8,12 +8,12 @@ Design brief: `docs/plans/2026-10-05-rate-target-design-brief.md`.
 ## What it does
 
 Instead of holding each market at a static bps target, the bot holds each
-STEERED market's **current borrow rate at SSR + 110 bps** — the number
+STEERED market's **current borrow rate at SSR + 60 bps** — the number
 borrowers react to. SSR is read on-chain from `sUSDS.ssr()`
 (`0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD`; per-second rate in RAY,
 `APY = (ssr / 1e27) ^ 31536000 − 1`). Each hour, per market:
 
-1. **Target rate** `b* = SSR + RATE_MARGIN_BPS` (110; per-market override
+1. **Target rate** `b* = SSR + RATE_MARGIN_BPS` (60; per-market override
    `RATE_MARGIN_<MARKET>_BPS`).
 2. **Target utilization** `u*` = the utilization at which Morpho's Adaptive
    Curve IRM prices the market at `b*` given its current anchor
@@ -267,7 +267,7 @@ change** to pick up rate-target steering.
 | `CAP_<MARKET>_USDS` | **REQUIRED** (this or `_BPS`) for every STEERED/PRIMARY market (PT-sUSDS: falls back to `PT_SUSDS_ABSOLUTE_CAP_USDS` once `_BPS` is set) | cap amount, whole USDS (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); `0` = hold nothing, drain everything |
 | `CAP_<MARKET>_BPS` | **REQUIRED** (this or `_USDS`) for every STEERED/PRIMARY market | cap as bps of totalAssets; `marketCap` = the smaller of the caps set; startup throws for a STEERED/PRIMARY market with neither; RETIRED markets need none |
 | `MIN_PRIORITY_WITHDRAWAL_USDS` | `50000` | smallest priority withdrawal, whole USDS; a smaller breach waits (a zero cap drains from the 100 USDS dust floor instead) |
-| `RATE_MARGIN_BPS` | `110` | target borrow rate = SSR + margin for STEERED markets |
+| `RATE_MARGIN_BPS` | `60` | target borrow rate = SSR + margin for STEERED markets |
 | `RATE_MARGIN_<MARKET>_BPS` | unset | per-market override of the margin (`CBBTC`/`WSTETH`/`WETH`/`PTSUSDS`/`STUSDS`); unset = global |
 | `UTIL_MIN_BPS` / `UTIL_MAX_BPS` | `8000` / `9500` | how far the bot itself pushes a market: a heating drain stops at max, a cooling deposit at min; a market already past a bound holds (`R-CLAMP`); validated `0 < min < max` |
 | `PRIMARY_MIN_UTIL_PERCENT` | `86` | a PRIMARY fill never pushes that market's utilization under this percent (fill target `min(cap, borrow × 100 / this)`); validated in [1, 100] |
