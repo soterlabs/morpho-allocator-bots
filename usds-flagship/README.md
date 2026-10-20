@@ -92,12 +92,13 @@ cooldown, no monopolist gate — only the pool's withdrawable liquidity
 replaces the market's steering wish (one wish per market per cycle). RETIRED
 markets are never drained, even above their cap.
 
-**PRIMARY market** (at most one; PT-sUSDS today). No rate input: its wish is
+**PRIMARY market** (at most one; none today — PT-sUSDS was PRIMARY from the
+bands launch to 2026-10-20 and is STEERED since). No rate input: its wish is
 "fill to the cap" as a **priority deposit** ($10k min action, grow cooldown
 and `MAX_ALLOCATE_USDS` still apply) — but never past the point where its own
 utilization would drop under `PRIMARY_MIN_UTIL_PERCENT` (80%): the fill target
-is `min(cap, borrow / 0.80)`, so PT grows with its own borrow demand instead
-of absorbing every dollar the steered markets free. The floor is a deposit-time
+is `min(cap, borrow / 0.80)`, so the market grows with its own borrow demand
+instead of absorbing every dollar the steered markets free. The floor is a deposit-time
 guard only — a position above it holds; it withdraws only through the
 priority-withdrawal rule.
 
@@ -112,8 +113,9 @@ common utilization). Legs below their threshold are dropped — $10k for a
 steering leg or a priority deposit, $50k for a priority withdrawal (a
 zero-cap withdrawal smaller than that passes only as a whole).
 
-Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH) | `PRIMARY`
-(PT-sUSDS — filled first, to its cap or its utilization floor) | `RETIRED`
+Market modes per env: `MODE_*` = `STEERED` (cbBTC, wstETH, PT-sUSDS — each
+held at SSR + `RATE_MARGIN_BPS`) | `PRIMARY` (none today — filled first, to
+its cap or its utilization floor) | `RETIRED`
 (stUSDS, WETH — never touched; keep `ORACLE_WETH` set so any residual WETH
 position stays visible to the completeness check).
 Cadence `0 * * * *` (hourly);
