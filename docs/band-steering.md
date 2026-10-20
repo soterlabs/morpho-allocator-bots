@@ -57,7 +57,8 @@ withdrawal, a HEAT market above its target still gets a deposit.
 
 Two things sit outside the rate target, both **priority** wishes that
 reconciliation serves before the ordinary ones. At most one market is
-**PRIMARY** (PT-sUSDS today): it has no rate target and is asked to fill up
+**PRIMARY** (none today — PT-sUSDS was PRIMARY from the bands launch to
+2026-10-20): it has no rate target and is asked to fill up
 to its cap — but never under its own utilization floor — as a **priority
 deposit**, served before every other deposit. And every non-RETIRED market
 carries an env **cap** (`CAP_<MARKET>_USDS` / `CAP_<MARKET>_BPS`); a position
@@ -167,7 +168,9 @@ RETIRED markets stay untouched even above their cap (`R-RETIRED`).
 
 ## Priority deposit (PRIMARY market)
 
-At most one market (PT-sUSDS today, `MODE_PTSUSDS=PRIMARY`). No rate input —
+At most one market (none today: PT-sUSDS ran as PRIMARY from the bands
+launch on 2026-10-01 to 2026-10-20 and is STEERED since, `MODE_PTSUSDS=STEERED`;
+the rule stays available for any market via `MODE_<MARKET>=PRIMARY`). No rate input —
 the anchor plays no role. Its wish is the whole gap up to its **fill
 target** as a **priority deposit** (`R-PRIORITY-DEPOSIT`), which
 reconciliation serves before any other deposit:
@@ -192,6 +195,24 @@ the fill starts. The shared sizing still applies: a gap below
 deallocate holds (`R-COOLDOWN`), and the grow is clamped to
 `MAX_ALLOCATE_USDS`. At or above the fill target the market holds (`R-HOLD`);
 it withdraws only through the priority-withdrawal rule.
+
+### PT-sUSDS as STEERED (2026-10-20)
+
+PT-sUSDS left PRIMARY on 2026-10-20 (`MODE_PTSUSDS=STEERED`, the code
+default). It is now held exactly like cbBTC and wstETH: borrow rate at
+SSR + `RATE_MARGIN_BPS` (SSR 3.80% + 60 bps = 4.40% that day), `u*` from
+its own anchor (3.80% → 90.5% utilization), clamped to
+[`UTIL_MIN_BPS`, `UTIL_MAX_BPS`]. What changes:
+
+- no priority fill: PT gets a deposit only when loopers push its borrow rate
+  above target + 10 bps (COOL), and a drain when it falls under (HEAT) — the
+  80% fill floor (`PRIMARY_MIN_UTIL_PERCENT`) no longer applies to any market;
+- the cap-breach priority withdrawal is unchanged (it runs before steering in
+  both modes), as are the liquidity reserve and the step caps;
+- a `DRY_RUN` replay on the 2026-10-19 23:00 UTC snapshot: PT $4.39M against
+  $3.96M borrow (90.2% util) → `u*` 90.5%, delta −$15k, inside the 50 bps
+  deadband → `R-DEADBAND` hold; the open cap breach ($0.21M over the 10% cap)
+  still waits for withdrawable liquidity. No immediate action either way.
 
 ## Vault-level reconciliation (`reconcile.ts`)
 
@@ -248,7 +269,7 @@ to the target the controller already headroomed.
 | stUSDS/USDS (0) | `MODE_STUSDS` | `RETIRED` | `RETIRED` |
 | cbBTC/USDS (1) | `MODE_CBBTC` | `STEERED` | `STEERED` |
 | wstETH/USDS (2) | `MODE_WSTETH` | `STEERED` | `STEERED` |
-| PT-sUSDS/USDS (3) | `MODE_PTSUSDS` | `STEERED` | `PRIMARY` |
+| PT-sUSDS/USDS (3) | `MODE_PTSUSDS` | `STEERED` | `STEERED` (was `PRIMARY` until 2026-10-20) |
 | WETH/USDS (4) | `MODE_WETH` | `RETIRED` | `RETIRED` |
 
 ## Environment variables (bands mode)
@@ -281,7 +302,7 @@ change** to pick up rate-target steering.
 | `MODE_CBBTC` | `STEERED` | |
 | `MODE_WSTETH` | `STEERED` | |
 | `MODE_WETH` | `RETIRED` | |
-| `MODE_PTSUSDS` | `STEERED` | `.env.example` sets `PRIMARY` |
+| `MODE_PTSUSDS` | `STEERED` | STEERED since 2026-10-20 (PRIMARY from 2026-10-01 to then); a deployment whose env still says `PRIMARY` keeps the fill rule — the switch is that env value |
 | `DRY_RUN` | `false` | `true` = compute + trace, execute nothing (shadow mode) |
 
 Existing allocator envs (`RPC_URL`, `PRIVATE_KEY`, `SAFE_ADDRESS`,
